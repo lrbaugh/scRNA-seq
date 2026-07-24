@@ -1,0 +1,92 @@
+---
+title: "Prepare tissue-specific DE data for CelEsT"
+subtitle: "Wrangle per_tissue datafile which can be directly inputted into CelEsT"
+author: "Sharan Surya"
+format: 
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-line-numbers: true
+    highlight-style: github  
+    theme: cosmo
+---
+
+```{r}
+#| label: document-chunk-options
+#| include: false
+
+rm(list = ls())
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  dpi = 300
+)
+
+options(scipen = 10000)
+```
+
+
+# Load libraries
+
+```{r}
+#| label: setup-libraries
+#| message: false
+#| warning: false
+
+library(dplyr)
+library(tidyverse)
+```
+
+# Import Data
+
+```{r}
+all_genes_per_tissue_log2FC_20231116 <- readRDS("input/all_genes_per_tissue_log2FC_20231116.rds")
+```
+
+# Data wrangling
+
+Compute wald_stat 
+
+```{r}
+all_genes_per_tissue_log2FC_20231116$wald_stat <- all_genes_per_tissue_log2FC_20231116$log2FoldChange / all_genes_per_tissue_log2FC_20231116$lfcSE
+```
+
+filter out genes expressed in less than 10% of samples in that tissue and remove unwanted columns
+
+```{r}
+all_genes_per_tissue_log2FC_20231116_filtered <- all_genes_per_tissue_log2FC_20231116 %>% 
+  filter(pct.starv > 0.1 | pct.fed > 0.1) %>% # filter out genes expressed in less than 10% of samples in that tissue
+  select(gene_id, tissue, wald_stat) 
+```
+
+
+
+```{r}
+# loop to split dataframe to each tissues and export
+
+tissues <- unique(all_genes_per_tissue_log2FC_20231116_filtered$tissue)
+
+for (t in tissues) {
+  tissue_temp <- all_genes_per_tissue_log2FC_20231116_filtered %>%
+    filter(tissue == t) %>%
+    select(gene_id, wald_stat)
+  
+  write.table(tissue_temp,
+              file = paste0("celest/output/waldstat/waldstat_per_tissue_", t, ".txt"),
+              sep = "\t", row.names = FALSE, quote = FALSE)
+}
+```
+
+
+
+# Session Info
+
+```{r}
+sessionInfo()
+```

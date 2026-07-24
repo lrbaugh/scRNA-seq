@@ -1,0 +1,186 @@
+---
+title: "Plots for Transcription Factor Activity Estimation with CelEsT"
+author: "Sharan Surya"
+format: 
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-line-numbers: true
+    highlight-style: github  
+    theme: cosmo
+---
+
+
+# Overview
+
+Plots for Transcription factor (TF) activity estimation using the CelEsT gene regulatory network. 
+
+
+
+```{r}
+#| label: document-chunk-options
+#| include: false
+
+rm(list = ls())
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  dpi = 300
+)
+
+options(scipen = 10000)
+
+```
+
+# Load Required Packages
+
+```{r}
+#| label: setup-libraries
+#| message: false
+#| warning: false
+
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(scales)
+library(readxl)
+```
+
+# Read Data from Analysis file
+
+```{r read-analysis-list}
+all_tf_activity <- readRDS("celest/output/all_tf_activity.rds")
+```
+
+
+# Visualization
+
+Generate publication-quality volcano plots for each tissue showing TF activity scores and significance.
+
+```{r volcano-plots, fig.width=10, fig.height=8, results='asis'}
+# Loop through each tissue and create volcano plot
+cairo_pdf("celest/plots/TF_activity_volcano_all_tissues.pdf", width = 10, height = 8, onefile = TRUE)
+
+
+for (tissue in names(all_tf_activity)) {
+  
+  cat("\n\n## ", tissue, "\n\n", sep = "")
+  
+  # Get tissue-specific data
+  tf_activity <- all_tf_activity[[tissue]]
+  
+  # Prepare data for visualization
+  plot_data <- data.frame(
+    tf_activity,
+    neglog10_p = -log10(tf_activity$p_value),
+    significant = tf_activity$p_value < 0.05
+  )
+  
+  # Add labels only for significant TFs
+  plot_data$label <- ifelse(plot_data$significant, plot_data$public_name, NA)
+  
+  # Define color scheme
+  colors <- c("grey50", "#E63946")
+  
+  # Create volcano plot
+  volcano_plot <- ggplot(plot_data, aes(x = score, y = neglog10_p)) +
+    # Add points
+    geom_point(
+      aes(color = significant),
+      size = 2.5,
+      alpha = 0.6,
+      show.legend = FALSE
+    ) +
+    # Significance threshold
+    geom_hline(
+      yintercept = -log10(0.05),
+      linetype = "dashed",
+      color = "black",
+      linewidth = 0.5
+    ) +
+    # Zero reference line
+    geom_vline(
+      xintercept = 0,
+      linetype = "dotted",
+      color = "grey30",
+      linewidth = 0.4
+    ) +
+    # Label significant TFs
+    geom_text_repel(
+      aes(label = label),
+      size = 3.5,
+      fontface = "italic",
+      box.padding = 0.5,
+      max.overlaps = 25,
+      min.segment.length = 0,
+      segment.size = 0.25,
+      segment.color = "grey30",
+      seed = 42
+    ) +
+    # Color scale
+    scale_color_manual(
+      values = colors,
+      name = NULL
+    ) +
+    # Axes
+    scale_x_continuous(expand = expansion(mult = 0.1)) +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.1))) +
+    # Labels with tissue name
+    labs(
+      x = "TF Activity Score",
+      y = expression(-log[10]~"(p-value)"),
+      title = paste("Transcription Factor Activity -", tissue)
+    ) +
+    # Theme
+    theme_minimal(base_size = 12) +
+    theme(
+      # Text
+      plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+      axis.title = element_text(size = 12, face = "bold"),
+      axis.text = element_text(size = 10, color = "black"),
+      
+      # Legend
+      legend.position = c(0.02, 0.98),
+      legend.justification = c(0, 1),
+      legend.background = element_rect(fill = "white", color = "grey80", linewidth = 0.5),
+      legend.text = element_text(size = 10),
+      legend.key.size = unit(0.4, "cm"),
+      legend.margin = margin(5, 5, 5, 5),
+      
+      # Panel
+      panel.grid.major = element_line(color = "grey90", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+      
+      # Background
+      plot.background = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA)
+    )
+  
+  # Display plot
+  print(volcano_plot)    
+  
+  cat("\n**Significant TFs:**", sum(plot_data$significant), "\n\n")
+  
+  # Show top 10 TFs for this tissue
+  top_tfs <- tf_activity[1:min(10, nrow(tf_activity)), 
+                         c("public_name", "score", "p_value", "Wormbase_mode_of_regulation")]
+  
+}
+
+dev.off()
+```
+
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+

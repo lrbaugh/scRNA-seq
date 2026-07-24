@@ -1,0 +1,486 @@
+---
+title: "Transcription Factor Activity Estimation with CelEsT"
+author: "Sharan Surya"
+format: 
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-line-numbers: true
+    highlight-style: github  
+    theme: cosmo
+---
+
+
+# Overview
+
+Transcription factor (TF) activity estimation using the orthCelEsT gene regulatory network and DESeq2 differential expression statistics. The analysis uses the multivariate linear model (MLM) method from the decoupleR package to infer TF activities from gene expression changes.
+
+
+
+```{r}
+#| label: document-chunk-options
+#| include: false
+
+rm(list = ls())
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  dpi = 300
+)
+
+options(scipen = 10000)
+
+```
+
+# Load Required Packages
+
+```{r load-packages, eval=FALSE}
+# Package installation code (already installed)
+# packages <- c("stringr", "openxlsx", "edgeR", "splines", 
+#               "dplyr", "ggplot2", "ggrepel")
+# 
+# biocmanager_packages <- c("DESeq2", "decoupleR")
+# note - wormRef has RAPToR as dependency, and RAPToR has pryr as dependency. However pryr is not available for R 4.6.1, so install RAPToR locally by editing out and replacing the pryr functions manually. 
+```
+
+```{r}
+#| label: setup-libraries
+#| message: false
+#| warning: false
+
+library(openxlsx)
+library(DESeq2)
+library(decoupleR)
+library(wormRef)
+library(dplyr)
+library(readxl)
+library(readr)
+library(wbData)
+library(tidyr)
+library(writexl)
+library(stringr)
+
+```
+
+# Define Helper Functions
+
+## Remove Duplicated Genes
+
+This function ensures no duplicated gene IDs are present in the dataset by removing all instances of duplicated IDs.
+
+```{r function-remove-duplicates}
+remove.duplicated.genes <- function(geneIDs) {
+  if (any(duplicated(geneIDs))) {
+    n_duplicates <- sum(duplicated(geneIDs) | duplicated(geneIDs, fromLast = TRUE))
+    
+    unique_gene_ids <- geneIDs[!(duplicated(geneIDs) | 
+                                  duplicated(geneIDs, fromLast = TRUE))]
+    
+    message(paste0(n_duplicates, 
+                   " genes removed from analysis due to duplicated gene IDs"))
+    
+    return(unique_gene_ids)
+  } else {
+    return(geneIDs)
+  }
+}
+```
+
+# Load Input Data
+
+## Load TF Annotations and CelEsT Network
+
+The CelEsT network contains transcription factor-target gene interactions with associated weights representing the mode of regulation. Also load the original .rds file to get the tissue names.
+
+```{r load-data}
+# Load TF annotations from manuscript supplementary files
+tf_annotations <- read_excel("celest/input/Table S1 - TF annotation.xlsx", sheet = 2)
+
+# Load CelEsT gene regulatory network
+# For alternative networks (orthCelEsT or maxCelEsT), modify the file path
+#celest_network <- read_excel("celest/input/Table S3 - CelEsT network annotated.xlsx", sheet = 2)
+celest_network <- read.delim("celest/input/orthCelEsT.txt", header = TRUE, stringsAsFactors = FALSE)
+
+all_genes_per_tissue_log2FC_20231116 <- readRDS("input/all_genes_per_tissue_log2FC_20231116.rds")
+colnames(all_genes_per_tissue_log2FC_20231116)
+```
+
+## Load Differential Expression Statistics
+
+We'll process all tissue-specific DE statistics files in a loop.
+
+
+```{r load-de-stats}
+
+tissue_names <- unique(all_genes_per_tissue_log2FC_20231116$tissue)
+
+# Alternative: Auto-detect tissue names from files in Input directory
+# tissue_files <- list.files("Input", pattern = "^waldstat_per_tissue_.*\\.txt$", full.names = FALSE)
+# tissue_names <- gsub("waldstat_per_tissue_|\\.txt$", "", tissue_files)
+
+cat("Found", length(tissue_names), "tissues to analyze:\n")
+cat(paste(tissue_names, collapse = ", "), "\n\n")
+```
+
+# Load detection_matrix to filter TFs prior to analysis 
+```{r load-detection}
+detection_matrix <- read.delim("output/detection_matrix_tissue.txt", header = TRUE, stringsAsFactors = FALSE)
+
+# add column sequence and match gene_id to sequence
+gids <- wb_load_gene_ids("WS296")
+detection_matrix <- detection_matrix |> 
+  left_join(gids |> 
+              select(sequence, gene_id),
+            by = c("X" = "gene_id"))
+
+```
+# Process All Tissues
+
+This section will loop through all tissue-specific DE statistics files and perform TF activity estimation for each tissue.
+
+Note: This can be done without looping! DecoupleR can take a matrix of DE statistics with multiple columns (one per tissue) and will return a matrix of TF activities with the same structure. Did not know this before!
+
+```{r process-all-tissues}
+
+# Initialize list to store results
+all_tf_activity <- list()
+all_backgrounds <- list()
+
+
+# Loop through each tissue
+for (tissue in tissue_names) {
+  
+  cat("\n", rep("=", 60), "\n", sep = "")
+  cat("Processing:", tissue, "\n")
+  cat(rep("=", 60), "\n\n", sep = "")
+  
+  # Construct file path
+  input_file <- paste0("celest/input/waldstat/waldstat_per_tissue_", tissue, ".txt")
+  
+  # Check if file exists
+  if (!file.exists(input_file)) {
+    cat("WARNING: File not found:", input_file, "- Skipping\n")
+    next
+  }
+  
+  # Filter celest_network to TFs detected in this tissue
+  if (!tissue %in% colnames(detection_matrix)) {
+    cat("WARNING: Tissue '", tissue, "' not found in detection_matrix - Skipping\n")
+    next
+  }
+  
+  detected_tfs <- detection_matrix$sequence[detection_matrix[[tissue]] == 1]
+  tissue_network <- celest_network[celest_network$source %in% detected_tfs, ]
+  all_backgrounds[[tissue]] <- unique(tissue_network$source)
+
+  cat("  TFs in network:  ", length(unique(celest_network$source)), "\n")
+  cat("  TFs detected:    ", length(detected_tfs), "\n")
+  cat("  TFs after filter:", length(unique(tissue_network$source)), "\n")
+  # ──────────────────────────────────────────────────────────────────────────
+  
+  # Load differential expression statistics
+  de_stats_raw <- read.delim(input_file)
+  
+  cat("  Loaded", nrow(de_stats_raw), "genes from", input_file, "\n")
+  
+  # Filter and format gene IDs
+  de_stats_filtered <- de_stats_raw[
+    str_remove(de_stats_raw[, 1], "\\.[a-z]{1,2}") %in% unlist(Cel_genes), 
+  ]
+  
+  # Remove duplicated genes
+  unique_genes <- remove.duplicated.genes(de_stats_filtered[, 1])
+  de_stats_filtered <- de_stats_filtered[match(unique_genes, de_stats_filtered[, 1]), ]
+  
+  # Extract DE statistics column and set gene IDs as row names
+  de_stats <- de_stats_filtered[, 2, drop = FALSE]
+  rownames(de_stats) <- unique_genes
+  
+  # Replace N A values with 0
+  de_stats[is.na(de_stats)] <- 0
+  
+  # Convert to sequence names
+  de_stats$sequence_name <- Cel_genes[
+    match(rownames(de_stats), Cel_genes[, "wb_id"]), 
+    "sequence_name"
+  ]
+  
+  # Remove duplicates in sequence names
+  unique_seq_names <- remove.duplicated.genes(de_stats[, 2])
+  de_stats <- de_stats[match(unique_seq_names, de_stats[, 2]), ]
+  
+  # Set sequence names as row names and keep only statistics column
+  rownames(de_stats) <- unique_seq_names
+  de_stats <- de_stats[, 1, drop = FALSE]
+  
+  cat("  Final matrix:", nrow(de_stats), "genes\n")
+  
+  # Estimate TF activity using the tissue-filtered network
+  cat("  Estimating TF activity...\n")
+  
+  tf_activity <- decoupleR::decouple(
+    mat = de_stats[, 1, drop = FALSE], 
+    network = tissue_network,          # <-- filtered network used here
+    .source = "source",
+    .target = "target",
+    statistics = "mlm",
+    args = list(mlm = list(.mor = "weight")),
+    consensus_score = FALSE
+  )
+  
+  cat("  Analyzed", nrow(tf_activity), "TFs\n")
+  
+  # Correct p-values for multiple testing
+  tf_activity$p_value <- p.adjust(tf_activity$p_value, method = "BH")
+  
+  # Annotate results
+  tf_activity <- cbind(
+    tf_activity,
+    Cel_genes[match(tf_activity$source, Cel_genes$sequence_name), c("wb_id", "public_name")]
+  )
+  
+  tf_activity$public_name <- toupper(tf_activity$public_name)
+  
+  tf_activity <- tf_activity %>%
+    left_join(
+      tf_annotations %>%
+        select(wormbase_gseq, Wormbase_mode_of_regulation, Uniprot_mode_of_regulation),
+      by = c("source" = "wormbase_gseq")
+    ) %>%
+    mutate(
+      Wormbase_mode_of_regulation = case_when(
+        Wormbase_mode_of_regulation == -1 ~ "REPRESSOR",
+        Wormbase_mode_of_regulation ==  0 ~ "BIFUNCTIONAL",
+        Wormbase_mode_of_regulation ==  1 ~ "ACTIVATOR",
+        TRUE ~ NA_character_
+      ),
+      Uniprot_mode_of_regulation = case_when(
+        Uniprot_mode_of_regulation == -1 ~ "REPRESSOR",
+        Uniprot_mode_of_regulation ==  0 ~ "BIFUNCTIONAL",
+        Uniprot_mode_of_regulation ==  1 ~ "ACTIVATOR",
+        TRUE ~ NA_character_
+      )
+    )
+  
+  # Sort by significance
+  tf_activity <- tf_activity[order(tf_activity$p_value), ]
+  
+  # Add tissue column
+  tf_activity$tissue <- tissue
+  
+  # Store in list
+  all_tf_activity[[tissue]] <- tf_activity
+  
+  # Export individual tissue results
+  output_file <- paste0("celest/output/tf_activity/TF_activity_", tissue, ".txt")
+  write.table(
+    tf_activity,
+    output_file,
+    sep = "\t",
+    quote = FALSE,
+    col.names = TRUE,
+    row.names = FALSE
+  )
+  
+  cat("  Saved results to:", output_file, "\n")
+  cat("  Significant TFs (p < 0.05):", sum(tf_activity$p_value < 0.05), "\n")
+  
+  
+}
+
+cat("\n", rep("=", 60), "\n", sep = "")
+cat("All tissues processed successfully!\n")
+cat(rep("=", 60), "\n", sep = "")
+```
+
+
+## Summary Across All Tissues
+
+```{r summary-table}
+summary_table <- data.frame(
+  Tissue = character(),
+  Total_TFs = integer(),
+  Significant_TFs = integer(),
+  TFs_up = integer(),
+  TFs_down = integer(),
+  Percent_Significant = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (tissue in names(all_tf_activity)) {
+  tf_data <- all_tf_activity[[tissue]]
+  n_total <- nrow(tf_data)
+  sig_idx <- tf_data$p_value < 0.05
+  n_sig <- sum(sig_idx)
+  n_up <- sum(sig_idx & tf_data$score > 0, na.rm = TRUE)
+  n_down <- sum(sig_idx & tf_data$score < 0, na.rm = TRUE)
+  pct_sig <- round(100 * n_sig / n_total, 2)
+  
+  summary_table <- rbind(
+    summary_table,
+    data.frame(
+      Tissue = tissue,
+      Total_TFs = n_total,
+      Significant_TFs = n_sig,
+      TFs_up = n_up,
+      TFs_down = n_down,
+      Percent_Significant = pct_sig
+    )
+  )
+}
+```
+
+
+
+# Export Results
+
+```{r export-combined-results}
+# First export the all_tf_activity list, so we don't have to do analysis again and just import
+saveRDS(all_tf_activity, "celest/output/all_tf_activity.rds")
+saveRDS(all_backgrounds, "celest/output/all_backgrounds.rds")
+
+# import without running the analysis again
+#all_tf_activity <- readRDS("celest/output/all_tf_activity.rds")
+
+# Combine all tissue results into one data frame
+combined_results <- do.call(rbind, all_tf_activity)
+
+# Save combined results
+write.table(
+  combined_results,
+  "celest/output/TF_activity_all_tissues_combined.txt",
+  sep = "\t",
+  quote = FALSE,
+  col.names = TRUE,
+  row.names = FALSE
+)
+
+# Combined results pivoted wider for tissues (each tissue has a column and the values are score) in the same sheet
+
+combined_results_wide <- combined_results %>%
+
+  # Keep only significant results
+  filter(p_value < 0.05) %>%
+  
+  # Remove unwanted columns
+  select(-run_id, -statistic, -condition) %>%
+  
+  # Pivot wider: tissue becomes columns, score becomes values
+  pivot_wider(
+    id_cols = c(source, wb_id, public_name, Wormbase_mode_of_regulation, Uniprot_mode_of_regulation),
+    names_from = tissue,
+    values_from = score
+  )
+
+write_xlsx(combined_results_wide, "celest/output/celest_combined_results_wide.xlsx")
+write_xlsx(summary_table, "celest/output/celest_summary_table.xlsx")
+
+  
+# Save Excel file with separate sheets for each tissue
+wb <- createWorkbook()
+
+for (tissue in names(all_tf_activity)) {
+  addWorksheet(wb, tissue)
+  writeData(wb, tissue, all_tf_activity[[tissue]])
+}
+
+saveWorkbook(wb, "celest/output/TF_activity_all_tissues.xlsx", overwrite = TRUE)
+
+cat("Results exported successfully!\n")
+cat("- Combined text file: celest/output/TF_activity_all_tissues_combined.txt\n")
+cat("- Excel file with all tissues: celest/output/TF_activity_all_tissues.xlsx\n")
+cat("- Individual tissue files: celest/output/TF_activity_[tissue].txt\n")
+```
+
+# Overall Summary Statistics
+
+```{r overall-summary-stats}
+# Collect significant TFs with direction of activity
+sig_tf_direction <- lapply(all_tf_activity, function(x) {
+  x_sig <- x[x$p_value < 0.05, c("public_name", "score")]
+  x_sig
+})
+
+# Combine all tissues into one data frame
+sig_tf_direction_df <- do.call(rbind, sig_tf_direction)
+
+# Add direction column
+sig_tf_direction_df$direction <- ifelse(
+  sig_tf_direction_df$score > 0, "Up",
+  ifelse(sig_tf_direction_df$score < 0, "Down", NA)
+)
+
+# Remove any NA directions (just in case score == 0)
+sig_tf_direction_df <- sig_tf_direction_df[!is.na(sig_tf_direction_df$direction), ]
+
+# Count number of tissues per TF per direction
+tf_direction_counts <- table(
+  sig_tf_direction_df$public_name,
+  sig_tf_direction_df$direction
+)
+
+# Convert to data frame
+tf_direction_counts_df <- as.data.frame.matrix(tf_direction_counts)
+
+# Ensure both columns exist
+if (!"Up" %in% colnames(tf_direction_counts_df)) {
+  tf_direction_counts_df$Up <- 0
+}
+if (!"Down" %in% colnames(tf_direction_counts_df)) {
+  tf_direction_counts_df$Down <- 0
+}
+
+# Add total significant tissues (optional, useful for sorting)
+tf_direction_counts_df$Total <- tf_direction_counts_df$Up + tf_direction_counts_df$Down
+
+# Sort by total number of tissues
+tf_direction_counts_df <- tf_direction_counts_df[
+  order(tf_direction_counts_df$Total, decreasing = TRUE),
+]
+
+# Export tf_direction_counts_df to a csv file
+write.csv(
+  tf_direction_counts_df,
+  "celest/output/TF_direction_counts_across_tissues.csv",
+  row.names = TRUE
+)
+
+# Display top 20 TFs
+top_tf_direction <- head(tf_direction_counts_df, 20)
+
+cat("Top 20 TFs with Increased / Decreased Activity Across Tissues:\n")
+cat("---------------------------------------------------------------\n")
+for (i in seq_len(nrow(top_tf_direction))) {
+  cat(sprintf(
+    "%-15s: %2d tissues up, %2d tissues down (Total: %2d)\n",
+    rownames(top_tf_direction)[i],
+    top_tf_direction$Up[i],
+    top_tf_direction$Down[i],
+    top_tf_direction$Total[i]
+  ))
+}
+```
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
+
+---
+
+## Outputs
+
+
+
+- Individual tissue results: `celest/output/TF_activity_[tissue].txt`
+- Combined results: `celest/output/TF_activity_all_tissues_combined.txt`
+- Excel workbook with all tissues: `celest/output/TF_activity_all_tissues.xlsx`
+- Volcano plots for each tissue: `celest/output/TF_activity_volcano_[tissue].png/.pdf`
+

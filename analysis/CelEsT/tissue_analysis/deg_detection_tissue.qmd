@@ -1,0 +1,747 @@
+---
+title: "Tissue - Detection and Differential Expression Analysis"
+author: "Sharan Surya"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    theme: cosmo
+    fig-width: 12
+    fig-height: 9
+    embed-resources: true
+---
+
+# Overview
+
+Are tissue-specific DEGs truly tissue-specific in their expression, or are they expressed in other tissues where they're just not differentially expressed?
+
+- **Detection:** Gene detected if normalized counts (starved OR fed) > threshold (threshold = 1)
+- **DEGs:** Gene is DE if padj < 0.05 AND |log2FC| > 1
+
+
+
+```{r setup, include=FALSE}
+rm(list = ls())
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  dpi = 300
+)
+
+options(scipen = 10000)
+
+```
+
+# Load Required Packages
+
+```{r}
+#| label: setup-libraries
+#| message: false
+#| warning: false
+
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(ggrepel)
+library(scales) # for comma formatting in axis labels
+library(viridis)
+library(seriation) # for OLO reordering of hclust
+library(ggpubr)
+
+```
+
+# Load Data
+
+## Load TF Activity Results
+
+Just to load tissue names.
+
+```{r load-tf-activity}
+# Load TF activity results to get tissue names
+tf_activity_by_tissue <- readRDS("celest/output/all_tf_activity.rds")
+
+tissue_names <- names(tf_activity_by_tissue)
+```
+
+## Load Log2FC Data
+
+```{r load-log2fc-data}
+# Load the log2FC file
+log2fc_data <- readRDS("input/all_genes_per_tissue_log2FC_20231116.rds")
+
+# Check unique tissues and match data with tf_activity
+identical(tissue_names, unique(log2fc_data$tissue))
+
+# Filter to protein-coding genes only
+log2fc_data <- log2fc_data[log2fc_data$gene_biotype == "protein_coding", ]
+
+```
+
+## Load pseudobulk Data
+
+```{r load-pseudobulk-data}
+# Load the pseudobulk file
+pseudobulk_data <- read_csv("input/DESeq2_pseudobulk_starv_vs_fed_20230916_minimum.csv")
+```
+
+# Data Processing
+
+## Create Detection Matrix
+
+```{r create-detection-matrix}
+# Detection threshold
+detection_threshold <- 0.1  # 10% of cells expressing a gene
+
+# Get unique gene IDs across all tissues
+all_protein_coding_gene_ids <- unique(log2fc_data$gene_id)
+
+# Initialize detection matrix: rows = genes, cols = tissues, values = 0/1
+detection_matrix <- matrix(0, 
+                           nrow = length(all_protein_coding_gene_ids),
+                           ncol = length(tissue_names),
+                           dimnames = list(all_protein_coding_gene_ids, tissue_names))
+
+
+# Fill detection matrix. If detected, TRUE = 1, FALSE = 0
+for (i in 1:nrow(log2fc_data)) {
+  gene <- log2fc_data$gene_id[i]
+  tissue <- log2fc_data$tissue[i]
+  
+  # Gene detected if expressed in either condition
+  pct_starved <- log2fc_data$pct.starv[i]
+  pct_fed     <- log2fc_data$pct.fed[i]
+  max_pct_expressed <- max(pct_starved, pct_fed, na.rm = TRUE)
+  
+  if (!is.na(max_pct_expressed) && max_pct_expressed >= detection_threshold) {
+    detection_matrix[gene, tissue] <- 1
+  }
+}
+
+genes_detected_per_tissue <- colSums(detection_matrix)
+
+```
+
+
+## Create DEG Matrix
+
+```{r create-deg-matrix}
+# Significance thresholds
+padj_threshold <- 0.05
+log2fc_threshold <- 0
+
+# Filter log2fc_data to include rows where pct.starv or pct.fed is above detection threshold
+log2fc_data <- log2fc_data %>%
+  filter(pct.starv >= detection_threshold | pct.fed >= detection_threshold)
+
+# Initialize DEG matrix: rows = genes, cols = tissues, values = 0/1
+deg_matrix <- matrix(0,
+                     nrow = length(all_protein_coding_gene_ids),
+                     ncol = length(tissue_names),
+                     dimnames = list(all_protein_coding_gene_ids, tissue_names))
+
+# Fill DEG matrix
+for (i in 1:nrow(log2fc_data)) {
+  gene <- log2fc_data$gene_id[i]
+  tissue <- log2fc_data$tissue[i]
+  padj <- log2fc_data$padj[i]
+  log2fc <- log2fc_data$log2FoldChange[i]
+  
+  if (!is.na(padj) && !is.na(log2fc)) {
+    if (padj < padj_threshold && abs(log2fc) > log2fc_threshold) {
+      deg_matrix[gene, tissue] <- 1
+    }
+  }
+}
+
+degs_detected_per_tissue <- colSums(deg_matrix)
+```
+
+
+# Jaccard Similarity Analysis
+
+Calculate Jaccard statistic for each gene:
+
+**Jaccard = (# tissues where gene is DE) / (# tissues where gene is detected)**
+
+This answers: "Of all tissues where a gene is expressed, in what proportion is it differentially expressed?"
+
+- Jaccard = 1.0: Gene is DE in every tissue where it's expressed
+- Jaccard = 0.0: Gene is never DE despite being expressed
+- Jaccard = 0.5: Gene is DE in half the tissues where it's expressed
+
+```{r jaccard-calculation}
+# Calculate Jaccard for each gene
+# Jaccard = n_deg_tissues / n_detected_tissues (per gene)
+calculate_jaccard <- function(detection_vector, deg_vector) {
+  n_detected_tissues <- sum(detection_vector == 1)
+  n_deg_tissues      <- sum(deg_vector == 1)
+  
+  # If gene not detected anywhere, return NA
+  if (n_detected_tissues == 0) return(NA)
+  
+  # Jaccard = proportion of detected tissues where gene is DE
+  return(n_deg_tissues / n_detected_tissues)
+}
+
+gene_jaccard_scores <- sapply(all_protein_coding_gene_ids, function(gene) {
+  calculate_jaccard(detection_matrix[gene, ], deg_matrix[gene, ])
+})
+
+gene_jaccard_df <- data.frame(
+  gene_id    = all_protein_coding_gene_ids,
+  jaccard    = gene_jaccard_scores,
+  n_detected_tissues = rowSums(detection_matrix),
+  n_deg_tissues      = rowSums(deg_matrix),
+  stringsAsFactors = FALSE
+)
+
+# Add gene names
+gene_jaccard_df$gene_name <- log2fc_data$gene_name[match(gene_jaccard_df$gene_id, 
+                                                          log2fc_data$gene_id)]
+
+# Filter out genes not detected anywhere
+gene_jaccard_detected <- gene_jaccard_df[!is.na(gene_jaccard_df$jaccard), ]
+
+```
+
+# Plot 1: Detection vs DEG Scatter
+
+```{r scatter-plot, fig.width=10, fig.height=8}
+tissue_detection_deg_counts <- data.frame(
+  tissue   = tissue_names,
+  n_detected_genes = genes_detected_per_tissue,
+  n_degs   = degs_detected_per_tissue
+)
+
+detection_deg_cor <- cor.test(tissue_detection_deg_counts$n_detected_genes, 
+                               tissue_detection_deg_counts$n_degs)
+
+
+scatter_plot <- ggplot(tissue_detection_deg_counts, aes(x = n_detected_genes, y = n_degs)) +
+  geom_point(size = 3.5, alpha = 0.75, color = "#4E6D8C") +
+  geom_text_repel(
+    aes(label = tissue),
+    size = 2,
+    box.padding = 0.5,
+    max.overlaps = 50,
+    segment.size = 0.25
+  ) +
+  geom_abline(slope = 1, intercept = 0, color = "#C0392B", linetype = "dashed", linewidth = 0.5) +
+  labs(
+    x = "Number of Detected Genes",
+    y = "Number of Differentially Expressed Genes"
+  ) +
+  scale_x_continuous(labels = comma, limits = c(0, 5000)) +
+  scale_y_continuous(labels = comma, limits = c(0, 5000)) +
+  theme_classic(base_size = 8) +
+  theme(
+    text = element_text(family = "Arial"),
+    axis.title = element_text(size = 8, face = "bold"),
+    panel.grid = element_blank(),
+    axis.title.x = element_text(margin = margin(t = 5)),
+    axis.title.y = element_text(margin = margin(r = 5))
+
+  )
+
+
+ggsave(
+  filename = "plots/scatter_detected_vs_deg_tissue.pdf", 
+  plot = scatter_plot,
+  width = 3, 
+  height = 3, 
+  units = "in",
+  device = cairo_pdf  # <--- THIS FIXES THE FONT ERROR
+)
+```
+
+
+# Plot 2: Jaccard Distribution
+```{r jaccard-dist, fig.width=12, fig.height=8}
+jaccard_median <- median(gene_jaccard_detected$jaccard)
+jaccard_mean   <- mean(gene_jaccard_detected$jaccard)
+
+jaccard_hist_plot <- ggplot(gene_jaccard_detected, aes(x = jaccard)) +
+  geom_histogram(binwidth = 0.02, boundary = 0, fill = "#4E6D8C", color = "white", alpha = 0.8) +
+  geom_vline(xintercept = jaccard_median, linetype = "dashed", 
+             color = "#2C3E50", linewidth = 1) +
+  geom_vline(xintercept = jaccard_mean, linetype = "dotted",
+             color = "#16A085", linewidth = 1) +
+  annotate("text", x = jaccard_median, y = Inf,
+           label = paste("Median =", round(jaccard_median, 3)),
+           vjust = 1.5, hjust = -0.1, size = 4, fontface = "bold",
+           color = "#2C3E50") +
+  annotate("text", x = jaccard_mean, y = Inf,
+           label = paste("Mean =", round(jaccard_mean, 3)),
+           vjust = 3, hjust = -0.1, size = 4, fontface = "bold",
+           color = "#16A085") +
+  scale_x_continuous(breaks = seq(0, 1, 0.1), limits = c(0, 1)) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    x = "Jaccard Index (# tissues DE / # tissues detected)",
+    y = "Number of Genes",
+    title = "Proportion of Detected Tissues Where Genes are Differentially Expressed",
+    subtitle = "Jaccard = 1: DE in all tissues where expressed | Jaccard = 0: Never DE despite expression"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title    = element_text(size = 14, face = "bold", hjust = 0.5, margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey40", margin = margin(b = 15)),
+    axis.title    = element_text(size = 11, face = "bold"),
+    panel.grid = element_blank()
+  )
+
+ggsave(
+  filename = "plots/jaccard_distribution_tissue.pdf", 
+  plot = jaccard_hist_plot,
+  width = 12, 
+  height = 8, 
+  units = "in",
+  device = cairo_pdf  # <--- THIS FIXES THE FONT ERROR
+)
+
+```
+
+# Plot 3: Detection vs DEG Breadth (No of tissues in both x and y)
+
+```{r expression-vs-de-circles, fig.width=11, fig.height=10}
+detection_vs_deg_breadth_plot <- ggplot(gene_jaccard_detected, aes(x = n_detected_tissues, y = n_deg_tissues)) +
+  geom_count(color = "#4E6D8C", alpha = 0.65) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", 
+              color = "#C0392B", linewidth = 0.5) +
+  scale_size_continuous(
+    name = "Number\nof Genes",
+    range = c(0.75, 5),
+    labels = comma
+  ) +
+  labs(
+    x = "Number of Tissues Gene is Detected",
+    y = "Number of Tissues Gene is DE"
+  ) +
+  scale_x_continuous(
+    limits = c(0, 18),
+    breaks = seq(0, 18, 2)
+  ) +
+  scale_y_continuous(
+    limits = c(0, 18),
+    breaks = seq(0, 18, 2)
+  ) +
+  theme_classic(base_size = 8) +
+  theme(
+    text = element_text(family = "Arial"),
+    axis.title    = element_text(size = 8, face = "bold"),
+    legend.position  = "NA",
+    axis.title.x = element_text(margin = margin(t = 5)),
+    axis.title.y = element_text(margin = margin(r = 5)),
+  )
+
+
+ggsave(
+  filename = "plots/expression_breadth_vs_de_breadth_tissue.pdf", 
+  plot = detection_vs_deg_breadth_plot,
+  width = 2.5, 
+  height = 2.5, 
+  units = "in",
+  device = cairo_pdf
+)
+```
+
+
+
+# Tissue Specificity
+
+Number of gene (y) vs Number of tissues where gene is DE (x) - this shows how many genes are DE in only 1 tissue, 2 tissues, etc.
+
+```{r tissue-specificity, fig.width=12, fig.height=8}
+deg_tissue_breadth <- data.frame(
+  gene_id      = rownames(deg_matrix),
+  n_tissues_de = rowSums(deg_matrix)
+) %>% filter(n_tissues_de > 0)
+
+deg_breadth_barplot <- ggplot(deg_tissue_breadth, aes(x = n_tissues_de)) +
+  geom_bar(fill = "#4E6D8C", color = "white", alpha = 0.8, width = 0.7) +
+  #geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5, size = 3.5) +
+  scale_x_reverse(
+    breaks = seq(0, 18, 2)
+  ) +
+  scale_y_continuous(
+    trans = scales::log_trans(base = 10),
+    labels = comma,
+    limits = c(1, NA)
+  ) +
+  labs(
+    x = "Number of Tissues Gene is DE",
+    y = "Number of Genes",
+  ) +
+  theme_classic(base_size = 8) +
+  theme(
+    text = element_text(family = "Arial"),
+    axis.title = element_text(size = 8, face = "bold"),
+    axis.text.y = element_text(angle = 90, vjust = 0.5,hjust = 0.5),
+    panel.grid = element_blank()
+  )
+
+ggsave(
+  filename = "plots/deg_specificity_tissue.pdf", 
+  plot = deg_breadth_barplot,
+  width = 2.5, 
+  height = 1.2, 
+  units = "in",
+  device = cairo_pdf
+)
+
+```
+
+
+# Tissue Detection Specificity
+
+Number of gene (y) vs Number of Tissues Gene is detected in (x) - this shows how many genes are detected in only 1 tissue, 2 tissues, etc.
+
+```{r tissue-detection-specificity, fig.width=12, fig.height=8}
+detection_tissue_breadth <- data.frame(
+  gene_id      = rownames(detection_matrix),
+  n_tissues_detected = rowSums(detection_matrix)
+) %>% filter(n_tissues_detected > 0)
+
+n_distinct(detection_tissue_breadth$gene_id)
+
+detection_breadth_barplot <- ggplot(detection_tissue_breadth, aes(x = n_tissues_detected)) +
+  geom_bar(fill = "#4E6D8C", color = "white", alpha = 0.8, width = 0.7) +
+  #geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5, size = 3.5) +
+  scale_x_continuous(
+    breaks = seq(0, 18, 2)
+  ) +
+  scale_y_continuous(
+    trans = scales::log_trans(base = 10),
+    labels = comma,
+    limits = c(1, NA)
+  ) +
+  labs(
+    x = "Number of Tissues Gene is Detected",
+    y = "Number of Genes"
+  ) +
+  
+  theme_classic(base_size = 8) +
+  theme(
+    text = element_text(family = "Arial"),
+    axis.title = element_text(size = 8, face = "bold"),
+    panel.grid = element_blank()
+  )
+
+ggsave(
+  filename = "plots/detection_specificity_tissue.pdf", 
+  plot = detection_breadth_barplot,
+  width = 2.5, 
+  height = 1.2, 
+  units = "in",
+  device = cairo_pdf
+)
+```
+
+
+
+# Total DEGs per Tissue
+
+Number of DEGs per tissue (y) vs Tissue (x) - this shows how many DEGs are in each tissue, regardless of whether they're unique or shared with other tissues.
+
+```{r total-degs}
+degs_per_tissue_vec <- colSums(deg_matrix)
+
+total_deg_per_tissue <- data.frame(
+  tissue = names(degs_per_tissue_vec),
+  n_degs = degs_per_tissue_vec
+)
+
+total_deg_barplot <- ggplot(total_deg_per_tissue, aes(x = reorder(tissue, n_degs), y = n_degs)) +
+  geom_bar(stat = "identity", fill = "#4E6D8C", alpha = 0.8) +
+  geom_text(aes(label = n_degs), vjust = -0.5, size = 3.5) +
+  labs(
+    title = "Differentially Expressed Genes per Tissue",
+    x = "Tissue",
+    y = "Number of DEGs"
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title  = element_text(size = 14, face = "bold", hjust = 0.5),
+    axis.title  = element_text(size = 12, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+
+ggsave(
+  filename = "plots/degs_per_tissue.pdf", 
+  plot = total_deg_barplot,
+  width = 12, 
+  height = 8, 
+  units = "in",
+  device = cairo_pdf
+)
+
+cat("\nTotal DEGs across all tissues:", sum(total_deg_per_tissue$n_degs), "\n")
+```
+
+# Unique DEGs per Tissue
+
+Number of DEGs that are unique to each tissue (y) vs Tissue (x) - this shows how many DEGs are found in only one tissue, which is a stronger indication of tissue-specificity.
+
+```{r unique-degs}
+# Genes DE in exactly one tissue
+single_tissue_deg_matrix <- deg_matrix[rowSums(deg_matrix) == 1, ]
+single_tissue_deg_counts_per_tissue <- colSums(single_tissue_deg_matrix)
+
+# Convert to data frame for plotting
+unique_deg_per_tissue <- data.frame(
+  tissue         = names(single_tissue_deg_counts_per_tissue),
+  n_unique_degs  = single_tissue_deg_counts_per_tissue
+)
+```
+
+```{r unique-degs-barplot, fig.width=12, fig.height=8}
+unique_deg_barplot <- ggplot(unique_deg_per_tissue, aes(x = reorder(tissue, n_unique_degs), y = n_unique_degs)) +
+  geom_bar(stat = "identity", fill = "#4E6D8C", alpha = 0.8) +
+  geom_text(aes(label = n_unique_degs), vjust = -0.5, size = 1.5) +
+  labs(
+    x = "Tissue",
+    y = "Number of Unique DEGs"
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  theme_classic(base_size = 8) +
+  theme(
+    text = element_text(family = "Arial"),
+    axis.title    = element_text(size = 8, face = "bold"),
+    axis.text.x   = element_text(angle = 45, hjust = 1),
+    legend.position = "none",
+    panel.grid = element_blank()
+  )
+
+
+ggsave(
+  filename = "plots/unique_degs_per_tissue.pdf", 
+  plot = unique_deg_barplot,
+  width = 5, 
+  height = 3.5, 
+  units = "in",
+  device = cairo_pdf
+)
+
+cat("\nTotal unique DEGs across all tissues:", sum(unique_deg_per_tissue$n_unique_degs), "\n")
+```
+
+# Heatmaps of Log2FC per Tissue
+
+```{r lfc-heatmap-prep}
+#| eval: false
+
+tissue_order <- c("Germline", "SGP", "hmc", "GLR",
+  "Pblast", "NonStriatedMuscle", "BWM", "Excretory", 
+  "Pharynx", "NonHypodermEpithelium", "Coelomocyte",
+  "Glia", "NonSeamHypoderm", "Seam", "PharyngealNeuron", 
+  "Neuron", "CiliatedNeuron", "Intestine")
+
+# Up/down regulation colors
+col_upregulated   <- "#7B2D8B"   # purple
+col_downregulated <- "#A8C500"   # yellow-green
+
+lfc_long <- log2fc_data %>%
+  select(gene_id, gene_name, log2FoldChange, padj, tissue) %>%
+  group_by(gene_name) %>%
+  filter(any(padj < 0.05, na.rm = TRUE)) %>%
+  ungroup()
+
+# Build gene x tissue matrix of log2FC values
+lfc_matrix <- lfc_long %>%
+  select(gene_name, tissue, log2FoldChange) %>%
+  pivot_wider(names_from = tissue, values_from = log2FoldChange) %>%
+  column_to_rownames("gene_name") %>%
+  as.matrix()
+
+lfc_matrix <- lfc_matrix[, tissue_order[tissue_order %in% colnames(lfc_matrix)]]
+lfc_matrix <- lfc_matrix[rowSums(!is.na(lfc_matrix)) > 0, ]
+lfc_matrix[is.na(lfc_matrix)] <- 0
+
+# Pearson distance + complete linkage hclust
+pearson_dist_genes <- as.dist(1 - cor(t(lfc_matrix), method = "pearson"))
+hclust_genes        <- hclust(pearson_dist_genes, method = "complete")
+
+# OLO via reorder() — exactly as described in methods - takes a while!!
+hclust_genes_olo <- reorder(hclust_genes, pearson_dist_genes, method = "OLO")
+
+gene_order_levels <- hclust_genes_olo$labels[hclust_genes_olo$order]
+
+# Consistent direction: downregulated at bottom
+first_gene_mean <- mean(lfc_matrix[gene_order_levels[1], ], na.rm = TRUE)
+if (first_gene_mean > 0) gene_order_levels <- rev(gene_order_levels)
+
+lfc_long_ordered <- lfc_long %>%
+  select(gene_name, tissue, log2FoldChange, padj) %>%
+  complete(gene_name, tissue = tissue_order) %>%
+  mutate(
+    direction = case_when(
+      log2FoldChange > 0 & padj < 0.05 ~ "Upregulated",
+      log2FoldChange < 0 & padj < 0.05 ~ "Downregulated",
+      TRUE                              ~ NA_character_
+    ),
+    gene_name = factor(gene_name, levels = gene_order_levels),
+    tissue    = factor(tissue, levels = tissue_order)
+  )
+
+deg_heatmap_tissue <- ggplot(lfc_long_ordered, aes(x = tissue, y = gene_name, fill = direction)) +
+  geom_tile(color = NA, alpha = 0.85) +
+  scale_fill_manual(
+    values       = c("Upregulated" = col_upregulated, "Downregulated" = col_downregulated),
+    na.value     = "black",
+    na.translate = FALSE,
+    name         = "Direction (starved/fed)"
+  ) +
+  labs(
+    title    = "Log2FC Across Tissues",
+    subtitle = paste0(n_distinct(lfc_long$gene_id), " significant genes"),
+    x        = "Tissue",
+    y        = NULL
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    plot.title       = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle    = element_text(size = 11, hjust = 0.5, color = "grey40"),
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 12),
+    axis.text.y      = element_blank(),
+    axis.ticks.y     = element_blank(),
+    legend.position  = "top",
+    legend.title     = element_text(size = 12, face = "bold"),
+    legend.key.width = unit(2, "cm"),
+    panel.grid       = element_blank(),
+    panel.background = element_rect(fill = "black")
+  )
+
+ggsave(
+  filename = "plots/deg_heatmap_tissue.pdf", 
+  plot = deg_heatmap_tissue,
+  width = 12, 
+  height = 12, 
+  units = "in",
+  device = cairo_pdf
+)
+
+```
+
+
+# Percent of TFs Significant (from CelEsT) vs Percent of Genes Detected that are DE
+
+```{r summary-table}
+summary_table <- data.frame(
+  Tissue = character(),
+  Total_TFs = integer(),
+  Significant_TFs = integer(),
+  TFs_up = integer(),
+  TFs_down = integer(),
+  Percent_Significant = numeric(),
+  Percent_deg = numeric(),
+  stringsAsFactors = FALSE
+)
+
+
+for (tissue in names(tf_activity_by_tissue)) {
+  tf_data <- tf_activity_by_tissue[[tissue]]
+  
+  n_total <- nrow(tf_data)
+  
+  sig_idx <- tf_data$p_value < 0.05
+  n_sig <- sum(sig_idx)
+  
+  n_up <- sum(sig_idx & tf_data$score > 0, na.rm = TRUE)
+  n_down <- sum(sig_idx & tf_data$score < 0, na.rm = TRUE)
+  
+  pct_sig <- round(100 * n_sig / n_total, 2)
+  pct_deg <- 100 * degs_detected_per_tissue[tissue] /genes_detected_per_tissue[tissue]
+
+
+  summary_table <- rbind(
+    summary_table,
+    data.frame(
+      Tissue = tissue,
+      Total_TFs = n_total,
+      Significant_TFs = n_sig,
+      TFs_up = n_up,
+      TFs_down = n_down,
+      Percent_Significant = pct_sig,
+      Percent_deg = pct_deg
+    )
+  )
+}
+
+scatter_tfs_vs_deg <- ggplot(
+  summary_table,
+  aes(x = Percent_deg, y = Percent_Significant)
+) +
+  geom_point(size = 2.5, alpha = 0.75, color = "#4E6D8C") +
+  geom_smooth(method = "lm", se = FALSE, color = "#C0392B",
+              linewidth = 0.6, fill = "#C0392B", alpha = 0.15) +
+  geom_text_repel(
+    aes(label = Tissue),
+    size = 2.5,
+    box.padding = 0.5,
+    max.overlaps = 30
+  ) +
+  stat_cor(method = "pearson", label.x = 5, label.y = 95, size = 2.5) +
+  stat_regline_equation(label.x = 5, label.y = 88, size = 2.5) +
+  labs(
+    x = "% genes detected that are DE",
+    y = "% significant TFs",
+  ) +
+  scale_x_continuous(limits = c(0, 100)) +
+  scale_y_continuous(limits = c(0, 100)) +
+  theme_classic(base_size = 8) +
+  theme(
+    axis.title = element_text(size = 8, face = "bold"),
+    panel.grid = element_blank()
+  )
+
+
+ggsave(
+  filename = "plots/scatter_significant_tfs_vs_deg_tissue.pdf", 
+  plot = scatter_tfs_vs_deg,
+  width = 5, 
+  height = 3.5, 
+  units = "in",
+  device = cairo_pdf
+)
+
+```
+
+# Export Results
+
+```{r export}
+write.table(gene_jaccard_df, "output/gene_jaccard_results_tissue.txt", 
+            sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(detection_matrix, "output/detection_matrix_tissue.txt",
+            sep = "\t", quote = FALSE, col.names = NA)
+write.table(deg_matrix, "output/deg_matrix_tissue.txt",
+            sep = "\t", quote = FALSE, col.names = NA)
+
+tissue_summary_stats <- data.frame(
+  tissue             = tissue_names,
+  n_detected_genes   = genes_detected_per_tissue,
+  n_degs             = degs_detected_per_tissue,
+  pct_deg            = round(100 * degs_detected_per_tissue / genes_detected_per_tissue, 2)
+)
+write.table(tissue_summary_stats, "output/summary_tissue.txt",
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+cat("Results exported\n")
+```
+
+
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+

@@ -1,0 +1,195 @@
+---
+title: "TF_activity and log2FC correlation across tissues"
+subtitle: ""
+author: "Sharan Surya"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    theme: cosmo
+    fig-width: 12
+    fig-height: 9
+    embed-resources: true
+---
+
+# Overview
+
+To generate a plot of Uniquely differentially expressed in each tissue. Similar to Figure 4F in the manuscript, but for all targets of TFs (not just DAF-16).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  dpi = 300
+)
+
+options(scipen = 10000)
+```
+
+# Load Required Packages
+
+```{r}
+#| label: setup-libraries
+#| message: false
+#| warning: false
+
+library(ggplot2)
+library(dplyr)
+library(readxl)
+library(writexl)
+library(tidyr)
+library(ggpmisc)
+
+```
+
+# Load Data
+
+```{r load-log2fc-data}
+tf_activity_log2fc <- readRDS("celest/output/tf_activity_log2fc.rds")
+
+all_backgrounds <- readRDS("celest/output/all_backgrounds.rds")
+all_tf_activity <- readRDS("celest/output/all_tf_activity.rds")
+
+# Import and clean 50TF table - from Ryan - manually annotated..
+tf_50 <- read_xlsx("celest/input/50TF_table_v2.xlsx") %>%
+  select(-`TF Family`)
+
+# Import TF annotation
+tf_annotation <- read_xlsx("celest/input/Table S1 - TF annotation.xlsx", 
+                           sheet = "Table S1 - TF annotation")
+```
+
+
+# Plot TF Activity vs Log2FC across tissues 
+
+```{r plot-tf-activity-log2fc, fig.width=10, fig.height=6}
+
+tf_activity_vs_log2fc <- ggplot(tf_activity_log2fc, aes(x = log2FoldChange, y = score_sig)) +
+  geom_vline(xintercept = 0,
+             linetype = "dashed", linewidth = 0.4, color = "grey60") +
+  geom_hline(yintercept = 0,
+             linetype = "dashed", linewidth = 0.4, color = "grey60") +
+  # Regression on Q1 and Q3 only
+  geom_smooth(
+    data = ~ filter(.x, (log2FoldChange > 0 & score_sig > 0) | 
+                        (log2FoldChange < 0 & score_sig < 0)),
+    method = "lm", se = FALSE,
+    color = "steelblue", fill = "steelblue",
+    linewidth = 0.7, alpha = 0.15
+  ) +
+  ggpmisc::stat_poly_eq(
+    data = ~ filter(.x, (log2FoldChange > 0 & score_sig > 0) | 
+                        (log2FoldChange < 0 & score_sig < 0)),
+    aes(label = paste(after_stat(rr.label), after_stat(p.value.label), sep = "~~")),
+    formula  = y ~ x,
+    parse    = TRUE,
+    size     = 2.5,
+    label.x  = "right",
+    label.y  = "top",
+    color    = "steelblue"
+  ) +
+  # All points
+  geom_point(size = 1.8, alpha = 0.85) +
+  ggrepel::geom_text_repel(
+    aes(label = public_name),
+    size          = 2.2,
+    max.overlaps  = 15,
+    segment.size  = 0.3,
+    segment.color = "grey60",
+    show.legend   = FALSE
+  ) +
+  facet_wrap(~ tissue, ncol = 5) +
+  labs(
+    x     = expression(bold(log[2]~FoldChange)),
+    y     = "CelEsT activity score",
+    title = "TF activity vs Log2FC across tissues",
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title       = element_text(hjust = 0.5, face = "bold"),
+    axis.title       = element_text(face = "bold"),
+    strip.background = element_rect(fill = "grey95", color = "grey80"),
+    strip.text       = element_text(size = 8, face = "bold"),
+    legend.position  = "bottom",
+    legend.text      = element_text(size = 8),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.caption     = element_text(size = 7, color = "grey50")
+  )
+
+
+ggsave(
+  filename = "celest/plots/tf_activity_vs_log2fc.pdf", 
+  plot = tf_activity_vs_log2fc,
+  width = 20, 
+  height = 14, 
+  units = "in",
+  device = cairo_pdf
+)
+
+```
+
+# Pull out TFs in each quadrant
+Q1 (log2FoldChange > 0, score_sig > 0)
+Q2 (log2FoldChange < 0, score_sig > 0)
+Q3 (log2FoldChange < 0, score_sig < 0)
+Q4 (log2FoldChange > 0, score_sig < 0)
+
+```{r pull-tf-quadrants, fig.width=10, fig.height=6}
+tf_activity_log2fc_quadrants <- tf_activity_log2fc %>%
+  mutate(quadrant = case_when(
+    log2FoldChange > 0 & score_sig > 0 ~ "Q1",
+    log2FoldChange < 0 & score_sig > 0 ~ "Q2",
+    log2FoldChange < 0 & score_sig < 0 ~ "Q3",
+    log2FoldChange > 0 & score_sig < 0 ~ "Q4",
+    TRUE ~ NA_character_
+  ))
+
+# make it wider such that columns are tissues and values are quadrants
+tf_activity_log2fc_quadrants_wide <- tf_activity_log2fc_quadrants %>%
+  select(public_name, wb_id, tissue, quadrant) %>%
+  pivot_wider(names_from = tissue, values_from = quadrant)
+
+# add a column which represents the quadrant across tissues for each TF. if multiple quadrants found for each TF, then concatenate them with a comma. ignore NAs
+
+tf_activity_log2fc_quadrants_wide <- tf_activity_log2fc_quadrants_wide %>%
+  rowwise() %>%
+  mutate(quadrant_across_tissues = paste(na.omit(c_across(-c(public_name, wb_id))), collapse = ",")) %>%
+  ungroup()
+```
+
+# Map it to phenotype table and annotation file to phenotype file (from Ryan - manually annotated).
+```{r map-tf-quadrants, fig.width=10, fig.height=6}
+
+# Add TF_family to tf_activity_log2fc_quadrants_wide by matching wb_id ~ wormbase_gene
+tf_activity_log2fc_quadrants_wide <- tf_activity_log2fc_quadrants_wide %>%
+  left_join(
+    tf_annotation %>% select(wormbase_gene, TF_family = Family_for_FigS4),
+    by = c("wb_id" = "wormbase_gene")
+  )
+
+# Add quadrant_across_tissues and TF_family to tf_50 by matching public_name
+tf_50 <- tf_50 %>%
+  left_join(
+    tf_activity_log2fc_quadrants_wide %>% 
+      select(public_name, quadrant_across_tissues, TF_family) %>% # replace with select(-wb_id) for all
+      distinct(),
+    by = "public_name"
+  )
+
+
+write_xlsx(tf_50, "celest/output/50TF_table_v2_SS.xlsx")
+```
+
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+

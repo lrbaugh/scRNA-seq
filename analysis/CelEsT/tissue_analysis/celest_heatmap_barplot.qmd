@@ -1,0 +1,790 @@
+---
+title: "Generate heatmaps of TF activity across tissues and barplots of TF tissue specificity"
+author: "Sharan Surya"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    theme: cosmo
+    fig-width: 12
+    fig-height: 9
+    embed-resources: true
+---
+
+# Overview
+
+```{r setup, include=FALSE}
+
+rm(list = ls())
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  dpi = 300
+)
+
+options(scipen = 10000)
+
+```
+
+# Load Required Packages
+
+```{r}
+#| label: setup-libraries
+#| message: false
+#| warning: false
+
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(patchwork)
+library(seriation)
+```
+
+# Load Data
+
+```{r load-log2fc-data}
+# Load the combined log2FC file
+log2fc_data <- readRDS("input/all_genes_per_tissue_log2FC_20231116.rds")
+
+# Filter to protein-coding genes only
+log2fc_data <- log2fc_data[log2fc_data$gene_biotype == "protein_coding", ]
+all_tf_activity <- readRDS("celest/output/all_tf_activity.rds")
+
+```
+
+
+# Heatmap of predicted TFs for each tissue
+
+```{r tf-heatmap-prep}
+# Fixed column order for all heatmaps
+tissue_order <- c("Germline", "SGP", "hmc", "GLR", "Pblast", "NonStriatedMuscle", "BWM", "Excretory", "Pharynx", "NonHypodermEpithelium", "Coelomocyte", "Glia", "NonSeamHypoderm", "Seam", "PharyngealNeuron", "Neuron", "CiliatedNeuron", "Intestine")
+
+# Combine all tissue TF activity data into one long data frame
+tf_activity_long <- bind_rows(all_tf_activity) %>%
+  select(wb_id, public_name, score, p_value, tissue)
+
+# Get union of all TFs across tissues
+all_tfs <- unique(tf_activity_long$public_name)
+```
+
+## Heatmap 1: TF Activity Score per Tissue
+
+```{r tf-heatmap-score, fig.width=14, fig.height=20}
+# Build TF x tissue matrix for OLO computation
+score_mat <- tf_activity_long %>%
+  select(public_name, tissue, score) %>%
+  pivot_wider(names_from = tissue, values_from = score) %>%
+  column_to_rownames("public_name") %>%
+  as.matrix()
+
+score_mat <- score_mat[, tissue_order[tissue_order %in% colnames(score_mat)]]
+score_mat[is.na(score_mat)] <- 0
+
+# OLO row ordering
+dist_rows <- dist(score_mat, method = "euclidean")
+olo_order <- seriation::seriate(dist_rows, method = "OLO")
+tf_levels <- rownames(score_mat)[seriation::get_order(olo_order)]
+
+# To ensure top is red (positive activity) - check if top TFs have higher mean score than bottom TFs; if not, reverse the order
+tf_means <- rowMeans(score_mat[tf_levels, , drop = FALSE], na.rm = TRUE)
+if (mean(head(tf_means, 10)) > mean(tail(tf_means, 10))) {
+  tf_levels <- rev(tf_levels)
+} # why ">"? because ggplot plots from bottom to top.
+
+# Back to long format with factor levels set by OLO
+score_long <- tf_activity_long %>%
+  select(public_name, tissue, score) %>%
+  mutate(
+    public_name = factor(public_name, levels = tf_levels),
+    tissue      = factor(tissue, levels = tissue_order)
+  )
+
+heatmap_score <- ggplot(score_long, aes(x = tissue, y = public_name, fill = score)) +
+  geom_tile(color = NA) +
+  scale_fill_gradient2(
+    low      = "#2C7BB6",
+    mid      = "white",
+    high     = "#D7191C",
+    midpoint = 0,
+    na.value = "grey90",
+    name     = "Activity\nScore"
+  ) +
+  labs(
+    title = "TF Activity Score Across Tissues",
+    x     = "Tissue",
+    y     = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(size = 14, face = "bold", hjust = 0.5),
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y     = element_blank(),
+    axis.ticks.y    = element_blank(),
+    panel.grid      = element_blank(),
+    legend.position = "right"
+  )
+
+ggsave(
+  filename = "celest/plots/tf_heatmap_score.pdf", 
+  plot = heatmap_score,
+  width = 12, 
+  height = 12, 
+  units = "in",
+  device = cairo_pdf
+)
+
+
+```
+
+## Heatmap 2: TF p-value per Tissue
+
+```{r tf-heatmap-pvalue, fig.width=14, fig.height=20}
+# Build -log10(p_value) matrix for OLO computation
+pval_mat <- tf_activity_long %>%
+  select(public_name, tissue, p_value) %>%
+  mutate(neg_log10_pval = -log10(p_value + 1e-300)) %>%
+  select(public_name, tissue, neg_log10_pval) %>%
+  pivot_wider(names_from = tissue, values_from = neg_log10_pval) %>%
+  column_to_rownames("public_name") %>%
+  as.matrix()
+
+pval_mat <- pval_mat[, tissue_order[tissue_order %in% colnames(pval_mat)]]
+
+# OLO row ordering
+dist_rows_pval <- dist(pval_mat, method = "euclidean")
+
+dist_rows_pval[is.na(dist_rows_pval)] <- 0
+
+olo_order_pval <- seriation::seriate(dist_rows_pval, method = "OLO")
+tf_levels_pval <- rownames(pval_mat)[seriation::get_order(olo_order_pval)]
+
+# To ensure top is red (positive activity) - check if top TFs have higher mean score than bottom TFs; if not, reverse the order
+tf_means_pval <- rowMeans(pval_mat[tf_levels_pval, , drop = FALSE], na.rm = TRUE)
+if (mean(head(tf_means_pval, 10)) > mean(tail(tf_means_pval, 10))) {
+  tf_levels_pval <- rev(tf_levels_pval)
+}
+
+# Back to long format
+pval_long <- tf_activity_long %>%
+  select(public_name, tissue, p_value) %>%
+  mutate(
+    neg_log10_pval = -log10(p_value + 1e-300),
+    public_name    = factor(public_name, levels = tf_levels_pval),
+    tissue         = factor(tissue, levels = tissue_order)
+  )
+
+heatmap_pval <- ggplot(pval_long, aes(x = tissue, y = public_name, fill = neg_log10_pval)) +
+  geom_tile(color = NA) +
+  scale_fill_gradient2(
+    low      = "#2C7BB6",
+    mid      = "white",
+    high     = "#D7191C",
+    midpoint = 0,
+    na.value = "grey90",
+    name     = "-log10\np-value"
+  ) +
+  labs(
+    title = "TF Significance Across Tissues  (-log10 p-value)",
+    x     = "Tissue",
+    y     = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(size = 14, face = "bold", hjust = 0.5),
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y     = element_blank(),
+    axis.ticks.y    = element_blank(),
+    panel.grid      = element_blank(),
+    legend.position = "right"
+  )
+
+
+ggsave(
+  filename = "celest/plots/tf_heatmap_pvalue.pdf", 
+  plot = heatmap_pval,
+  width = 12, 
+  height = 12, 
+  units = "in",
+  device = cairo_pdf
+)
+
+```
+
+## Heatmap 3: Score (significant TFs only, p-value < 0.05)
+
+```{r tf-heatmap-score-sig, fig.width=14, fig.height=20}
+# Mask score with NA where p_value >= 0.05
+sig_long <- tf_activity_long %>%
+  mutate(score_sig = if_else(p_value < 0.05, score, NA_real_))
+
+
+# Keep only TFs significant in at least one tissue
+tfs_with_sig <- sig_long %>%
+  group_by(public_name) %>%
+  summarise(n_sig = sum(!is.na(score_sig)), .groups = "drop") %>%
+  filter(n_sig >= 1) %>%
+  pull(public_name)
+
+tfs_with_sig_wbid <- sig_long %>%
+  group_by(wb_id) %>%
+  summarise(n_sig = sum(!is.na(score_sig)), .groups = "drop") %>%
+  filter(n_sig >= 1) %>%
+  pull(wb_id)
+
+write_delim(
+  data.frame(tfs_with_sig_wbid),
+  "celest/output/tf_with_sig_wbid.txt",
+  delim = ",",
+  col_names = FALSE
+)
+# Build matrix for OLO (NAs replaced with 0 only for distance calculation)
+sig_mat <- sig_long %>%
+  filter(public_name %in% tfs_with_sig) %>%
+  select(public_name, tissue, score_sig) %>%
+  pivot_wider(names_from = tissue, values_from = score_sig) %>%
+  column_to_rownames("public_name") %>%
+  as.matrix()
+
+sig_mat <- sig_mat[, tissue_order[tissue_order %in% colnames(sig_mat)]]
+
+sig_mat_nona <- sig_mat
+sig_mat_nona[is.na(sig_mat_nona)] <- 0
+dist_rows_sig <- dist(sig_mat_nona, method = "euclidean")
+olo_order_sig <- seriation::seriate(dist_rows_sig, method = "OLO")
+tf_levels_sig <- rownames(sig_mat)[seriation::get_order(olo_order_sig)]
+
+# To ensure top is red (positive activity) - check if top TFs have higher mean score than bottom TFs; if not, reverse the order
+tf_means_sig <- rowMeans(sig_mat[tf_levels_sig, , drop = FALSE], na.rm = TRUE)
+if (mean(head(tf_means_sig, 10)) > mean(tail(tf_means_sig, 10))) {
+  tf_levels_sig <- rev(tf_levels_sig)
+}
+
+# Back to long format, with OLO factor levels
+sig_long_filtered <- sig_long %>%
+  filter(public_name %in% tfs_with_sig) %>%
+  complete(public_name, tissue = tissue_order) %>%   # creates missing rows as NA
+  mutate(
+    public_name = factor(public_name, levels = tf_levels_sig),
+    tissue      = factor(tissue, levels = tissue_order)
+  )
+
+heatmap_score_sig <- ggplot(sig_long_filtered,
+                             aes(x = tissue, y = public_name, fill = score_sig)) +
+  geom_tile(color = NA) +
+  scale_fill_gradient2(
+    low      = "#2C7BB6",
+    mid      = "white",
+    high     = "#D7191C",
+    midpoint = 0,
+    na.value = "grey90",
+    name     = "Activity\nScore"
+  ) +
+  labs(
+    title    = "TF Activity Score Across Tissues (p < 0.05 only)",
+    subtitle = paste0(length(tfs_with_sig),
+                      " TFs with \u22651 significant tissue shown; grey = not significant"),
+    x        = "Tissue",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    aspect.ratio = 0.7,
+    plot.title      = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle   = element_text(size = 10, hjust = 0.5, color = "grey40"),
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y     = element_blank(),
+    axis.ticks.y    = element_blank(),
+    panel.grid      = element_blank(),
+    legend.position = "right"
+  )
+
+ggsave(
+  filename = "celest/plots/tf_heatmap_score_significant.pdf", 
+  plot = heatmap_score_sig,
+  width = 12, 
+  height = 12, 
+  units = "in",
+  device = cairo_pdf
+)
+
+```
+
+
+## Heatmap 4: Score (significant TFs only, p-value < 0.05) top50
+
+```{r tf-heatmap-score-sig-top50, fig.width=14, fig.height=20}
+# Mask score with NA where p_value >= 0.05
+sig_long_t50 <- tf_activity_long %>%
+  mutate(score_sig = if_else(p_value < 0.05, score, NA_real_))
+
+write_delim(
+  data.frame(unique(sig_long_t50$wb_id)),
+  "celest/output/all_tfs_wbid.txt",
+  delim = ",",
+  col_names = FALSE
+)
+
+# Rank TFs by number of significant tissues, then mean score; keep top 50
+tf_order_top50 <- sig_long_t50 %>%
+  group_by(public_name) %>%
+  summarise(
+    n_sig      = sum(!is.na(score_sig)),
+    mean_score = mean(score_sig, na.rm = TRUE),
+    .groups    = "drop"
+  ) %>%
+  filter(n_sig >= 1) %>%
+  arrange(desc(n_sig), desc(mean_score)) %>%
+  slice_head(n = 50) %>%
+  pull(public_name)
+
+tf_order_top50_wbid <- sig_long_t50 %>%
+  group_by(wb_id) %>%
+  summarise(
+    n_sig      = sum(!is.na(score_sig)),
+    mean_score = mean(score_sig, na.rm = TRUE),
+    .groups    = "drop"
+  ) %>%
+  filter(n_sig >= 1) %>%
+  arrange(desc(n_sig), desc(mean_score)) %>%
+  slice_head(n = 50) %>%
+  pull(wb_id)
+
+write_delim(
+  data.frame(tf_order_top50_wbid),
+  "celest/output/tf_order_top50_wbid.txt",
+  delim = ",",
+  col_names = FALSE
+)
+
+# Build top-50 matrix for OLO
+sig_mat_t50 <- sig_long_t50 %>%
+  filter(public_name %in% tf_order_top50) %>%
+  select(public_name, tissue, score_sig) %>%
+  pivot_wider(names_from = tissue, values_from = score_sig) %>%
+  column_to_rownames("public_name") %>%
+  as.matrix()
+
+sig_mat_t50 <- sig_mat_t50[, tissue_order[tissue_order %in% colnames(sig_mat_t50)]]
+
+sig_mat_t50_nona <- sig_mat_t50
+sig_mat_t50_nona[is.na(sig_mat_t50_nona)] <- 0
+dist_rows_t50 <- dist(sig_mat_t50_nona, method = "euclidean")
+olo_order_t50 <- seriation::seriate(dist_rows_t50, method = "OLO")
+tf_levels_t50 <- rownames(sig_mat_t50)[seriation::get_order(olo_order_t50)]
+
+tf_means_t50 <- rowMeans(sig_mat_t50[tf_levels_t50, , drop = FALSE], na.rm = TRUE)
+if (mean(head(tf_means_t50, 10)) > mean(tail(tf_means_t50, 10))) {
+  tf_levels_t50 <- rev(tf_levels_t50)
+}
+
+# Back to long format with OLO factor levels
+sig_long_t50_filtered <- sig_long_t50 %>%
+  filter(public_name %in% tf_order_top50) %>%
+  complete(public_name, tissue = tissue_order) %>%   # creates missing rows as NA
+  mutate(
+    public_name = factor(public_name, levels = tf_levels_t50),
+    tissue      = factor(tissue, levels = tissue_order)
+  )
+
+heatmap_score_t50 <- ggplot(sig_long_t50_filtered,
+                             aes(x = tissue, y = public_name, fill = score_sig)) +
+  geom_tile(color = NA) +
+  scale_fill_gradient2(
+    low      = "#2C7BB6",
+    mid      = "white",
+    high     = "#D7191C",
+    midpoint = 0,
+    na.value = "grey90",
+    name     = "Activity\nScore"
+  ) +
+  labs(
+    title    = "TF Activity Score Across Tissues (p < 0.05 only, top 50 TFs)",
+    subtitle = "Top 50 TFs by tissue breadth and mean score; grey = not significant",
+    x        = "Tissue",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle   = element_text(size = 10, hjust = 0.5, color = "grey40"),
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 12),
+    axis.text.y     = element_text(size = 12),
+    axis.ticks.y    = element_blank(),
+    panel.grid      = element_blank(),
+    legend.position = "right"
+  )
+
+ggsave(
+  filename = "celest/plots/tf_heatmap_score_significant_t50.pdf", 
+  plot = heatmap_score_t50,
+  width = 12, 
+  height = 12, 
+  units = "in",
+  device = cairo_pdf
+)
+
+```
+
+## Heatmap 5: Score (significant TFs only, p-value < 0.05) top50 based on highest score, not no. of tissues
+
+```{r tf-heatmap-score-sig-top50-score, fig.width=14, fig.height=20}
+
+# Rank TFs by max absolute score; keep top 50
+
+sig_long_t50_score <- tf_activity_long %>%
+  mutate(score_sig = if_else(p_value < 0.05, score, NA_real_))
+
+tf_rank_top50_score <- sig_long_t50_score %>%
+  filter(!is.na(score_sig)) %>%          # drop NA rows upfront
+  group_by(public_name) %>%
+  summarise(
+    score_sig = score_sig[which.max(abs(score_sig))],
+    .groups = "drop"
+  ) %>%
+  filter(is.finite(score_sig)) %>%
+  arrange(desc(abs(score_sig))) %>%
+  slice_head(n = 50)
+
+tf_order_top50_score <- tf_rank_top50_score$public_name
+
+write.table(tf_rank_top50_score,
+            file = "celest/output/tf_rank_top50_score.tsv",
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE)
+
+tf_rank_top50_score_wbid <- sig_long_t50_score %>%
+  filter(!is.na(score_sig)) %>%          # drop NA rows upfront
+  group_by(wb_id) %>%
+  summarise(
+    max_score_sig = max(abs(score_sig), na.rm = TRUE),
+    .groups       = "drop"
+  ) %>%
+  filter(is.finite(max_score_sig)) %>%
+  arrange(desc(max_score_sig)) %>%
+  slice_head(n = 50) %>%
+  pull(wb_id)
+
+write_delim(
+  data.frame(tf_rank_top50_score_wbid),
+  "celest/output/tf_rank_top50_score_wbid.txt",
+  delim = ",",
+  col_names = FALSE
+)
+
+# Build top-50 matrix for OLO
+
+sig_mat_t50_score <- sig_long_t50_score %>%
+  filter(public_name %in% tf_order_top50_score) %>%
+  select(public_name, tissue, score_sig) %>%
+  pivot_wider(names_from = tissue, values_from = score_sig) %>%
+  column_to_rownames("public_name") %>%
+  as.matrix()
+
+# Ensure tissue order
+sig_mat_t50_score <- sig_mat_t50_score[
+  , tissue_order[tissue_order %in% colnames(sig_mat_t50_score)]
+]
+
+# Replace NA with 0 for distance computation
+sig_mat_t50_score_nona <- sig_mat_t50_score
+sig_mat_t50_score_nona[is.na(sig_mat_t50_score_nona)] <- 0
+
+
+dist_rows_t50_score <- dist(sig_mat_t50_score_nona, method = "euclidean")
+olo_order_t50_score <- seriation::seriate(dist_rows_t50_score, method = "OLO")
+
+tf_levels_t50_score <- rownames(sig_mat_t50_score)[
+  seriation::get_order(olo_order_t50_score)
+]
+  
+
+tf_means_t50_score <- rowMeans(sig_mat_t50_score[tf_levels_t50_score, , drop = FALSE], na.rm = TRUE)
+if (mean(head(tf_means_t50_score, 10)) < mean(tail(tf_means_t50_score, 10))) {
+  tf_levels_t50_score <- rev(tf_levels_t50_score)
+}
+
+# Back to long format with OLO factor levels
+sig_long_t50_filtered_score <- sig_long_t50_score %>%
+  filter(public_name %in% tf_order_top50_score) %>%
+  complete(public_name, tissue = tissue_order) %>%   # creates missing rows as NA
+  mutate(
+    public_name = factor(public_name, levels = rev(tf_levels_t50_score)),
+    tissue      = factor(tissue, levels = tissue_order)
+  )
+
+heatmap_score_t50_score <- ggplot(
+  sig_long_t50_filtered_score,
+  aes(x = tissue, y = public_name, fill = score_sig)
+) +
+  geom_tile(color = NA) +
+  scale_fill_gradient2(
+    low      = "#2166AC",
+    mid      = "white",
+    high     = "#B2182B",
+    midpoint = 0,
+    na.value = "grey90",
+    name     = "Activity\nScore"
+  ) +
+  labs(
+    x        = NULL,
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(
+    axis.title      = element_text(face = "bold"),
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y     = element_text(size = 6),
+    axis.ticks.y    = element_blank(),
+    panel.grid      = element_blank(),
+    legend.position = "right"
+  )
+
+ggsave(
+  filename = "celest/plots/tf_heatmap_score_significant_t50_score.pdf", 
+  plot = heatmap_score_t50_score,
+  width = 6.5, 
+  height = 5, 
+  units = "in",
+  device = cairo_pdf
+)
+```
+
+# Number of TFs Enriched per Number of Tissues
+
+How many TFs are significantly active (p < 0.05) in exactly 1, 2, 3 … 18 tissues?
+
+```{r tf-tissue-breadth-barplot, fig.width=10, fig.height=6}
+# Count number of significant tissues per TF
+tf_breadth <- tf_activity_long %>%
+  filter(p_value < 0.05) %>%
+  group_by(public_name) %>%
+  summarise(n_tissues = n_distinct(tissue), .groups = "drop")
+
+# Count how many TFs fall into each tissue-count bin; ensure all 1–18 are present
+tf_breadth_counts <- tf_breadth %>%
+  dplyr::count(n_tissues, name = "n_tfs") %>%
+  complete(n_tissues = 1:18, fill = list(n_tfs = 0))
+
+barplot_breadth <- ggplot(tf_breadth_counts, aes(x = n_tissues, y = n_tfs)) +
+  geom_col(fill = "#3498DB", colour = "white", width = 0.75, alpha = 0.8) +
+  geom_text(
+    aes(label = ifelse(n_tfs > 0, n_tfs, "")),
+    vjust = -0.4,
+    size  = 3.5,
+    fontface = "bold",
+    colour = "#2C3E50"
+  ) +
+  scale_x_continuous(
+    breaks = 1:18,
+    limits = c(0.25, 18.75),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title    = "Number of TFs Enriched Across Tissues",
+    subtitle = "Significance threshold: p < 0.05  |  Total tissues = 18",
+    x        = "Number of tissues TF is significantly active in",
+    y        = "Number of TFs"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title    = element_text(size = 14, face = "bold",  hjust = 0.5),
+    plot.subtitle = element_text(size = 10, colour = "grey40", hjust = 0.5),
+    axis.title    = element_text(size = 11, face = "bold"),
+    axis.text     = element_text(size = 10),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.border  = element_rect(colour = "black", fill = NA, linewidth = 0.7)
+  )
+
+ggsave(
+  filename = "celest/plots/tf_tissue_breadth_barplot.pdf", 
+  plot = barplot_breadth,
+  width = 6.5, 
+  height = 5, 
+  units = "in",
+  device = cairo_pdf
+)
+
+```
+
+
+# Number of TFs Enriched per Tissue (with Direction of Activity)
+
+How many TFs are significantly active (p < 0.05) in each tissue, and in which direction?
+
+```{r tf-tissue-direction-barplot, fig.width=12, fig.height=7}
+# Collect significant TFs with direction of activity
+sig_tf_direction <- lapply(all_tf_activity, function(x) {
+  x_sig <- x[x$p_value < 0.05, c("public_name", "score", "tissue")]
+  x_sig
+})
+
+# Combine all tissues into one data frame
+sig_tf_direction_df <- do.call(rbind, sig_tf_direction)
+
+# Add direction column
+sig_tf_direction_df$direction <- ifelse(
+  sig_tf_direction_df$score > 0, "Up",
+  ifelse(sig_tf_direction_df$score < 0, "Down", NA)
+)
+
+# Remove any NA directions (just in case score == 0)
+sig_tf_direction_df <- sig_tf_direction_df[!is.na(sig_tf_direction_df$direction), ]
+
+# Count number of TFs per tissue per direction
+tf_tissue_dir_counts <- sig_tf_direction_df %>%
+  group_by(tissue, direction) %>%
+  summarise(n_tfs = n_distinct(public_name), .groups = "drop") %>%
+  mutate(direction = factor(direction, levels = c("Up", "Down")))
+
+# Compute total (Up + Down) per tissue for sorting
+tissue_totals <- tf_tissue_dir_counts %>%
+  group_by(tissue) %>%
+  summarise(total = sum(n_tfs), .groups = "drop") %>%
+  mutate(tissue = factor(tissue, levels = tissue_order))# if wanted to arrange tissues in terms of No. of TFs,change it to -> arrange(desc(total))
+
+tf_tissue_dir_counts <- tf_tissue_dir_counts %>%
+  mutate(tissue = factor(tissue, levels = tissue_order))
+
+
+barplot_direction <- ggplot(tf_tissue_dir_counts,
+                            aes(x = tissue, y = n_tfs, fill = direction)) +
+  geom_col(width = 0.75, alpha = 1, position = "stack") +
+  geom_text(
+    data = tissue_totals,
+    aes(x = tissue, y = total, label = total),
+    vjust       = -0.4,
+    size        = 2,
+    fontface    = "bold",
+    colour      = "#000000",
+    inherit.aes = FALSE
+  ) +
+  scale_fill_manual(
+    values = c("Up" = "#B2182B", "Down" = "#2166AC"),
+    name   = "Activity"
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    x        = "Tissue",
+    y        = "Number of TFs"
+  ) +
+  theme_classic(base_size = 8) +
+  theme(
+    axis.title    = element_text(size = 8, face = "bold"),
+    axis.text.x   = element_text(angle = 45, hjust = 1),
+    legend.position = "top",
+    legend.key.size = unit(0.2, "cm")
+  )
+
+ggsave(
+  filename = "celest/plots/tf_tissue_direction_barplot.pdf", 
+  plot = barplot_direction,
+  width = 3.2, 
+  height = 3, 
+  units = "in",
+  device = cairo_pdf
+)
+```
+
+# Number of TFs Enriched per Number of Tissues (with Direction of Activity)
+
+How many TFs are significantly active (p < 0.05) in exactly 1, 2, 3 … 18 tissues, broken down by direction of activity?
+
+```{r tf-breadth-direction-barplot, fig.width=10, fig.height=6}
+# Count number of significant tissues per TF, with direction
+tf_breadth_dir <- sig_tf_direction_df %>%
+  group_by(public_name, direction) %>%
+  summarise(n_tissues = n_distinct(tissue), .groups = "drop")
+
+# Count how many TFs fall into each tissue-count bin per direction
+tf_breadth_dir_counts <- tf_breadth_dir %>%
+  group_by(n_tissues, direction) %>%
+  summarise(n_tfs = n(), .groups = "drop") %>%
+  complete(n_tissues = 1:18, direction = c("Up", "Down"), fill = list(n_tfs = 0)) %>%
+  mutate(direction = factor(direction, levels = c("Up", "Down")))
+
+barplot_breadth_dir <- ggplot(tf_breadth_dir_counts,
+                              aes(x = n_tissues, y = n_tfs, fill = direction)) +
+  geom_col(width = 0.75, alpha = 0.85, position = "stack") +
+  geom_text(
+    data = tf_breadth_dir_counts %>%
+      group_by(n_tissues) %>%
+      summarise(total = sum(n_tfs), .groups = "drop") %>%
+      filter(total > 0),
+    aes(x = n_tissues, y = total, label = total),
+    vjust    = -0.4,
+    size     = 2,
+    fontface = "bold",
+    colour   = "#000000",
+    inherit.aes = FALSE
+  ) +
+  scale_x_continuous(
+    breaks = 1:18,
+    limits = c(0.25, 18.75),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  scale_fill_manual(
+    values = c("Up" = "#B2182B", "Down" = "#2166AC"),
+    name   = "Activity"
+  ) +
+  labs(
+    x        = "Number of tissues TF is significantly active in",
+    y        = "Number of TFs"
+  ) +
+  theme_classic(base_size = 8) +
+  theme(
+    axis.title    = element_text(size = 8, face = "bold"),
+    axis.text     = element_text(size = 8),
+    legend.position = "top",
+    legend.key.size = unit(0.2, "cm")
+  )
+
+
+ggsave(
+  filename = "celest/plots/tf_tissue_breadth_direction_barplot.pdf", 
+  plot = barplot_breadth_dir,
+  width = 3.2, 
+  height = 3, 
+  units = "in",
+  device = cairo_pdf
+)
+```
+
+
+# TF Activity vs Log2FC across tissues 
+
+```{r tf-activity-log2fc, fig.width=10, fig.height=6}
+
+# merge significant TF activity data with significant log2FC data for the corresponding TFs and tissues
+
+tf_activity_log2fc <- sig_long_filtered %>%
+  filter(p_value < 0.05) %>% 
+  left_join(log2fc_data, by = c("wb_id" = "gene_id", "tissue" = "tissue")) %>%
+  filter(padj < 0.05)
+
+saveRDS(tf_activity_log2fc, "celest/output/tf_activity_log2fc.rds")
+```
+
+
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+

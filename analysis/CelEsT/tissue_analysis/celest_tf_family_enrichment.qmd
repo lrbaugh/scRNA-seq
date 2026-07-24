@@ -1,0 +1,317 @@
+---
+title: "TF family enrichment in significant TFs and top50 TFs"
+author: "Sharan Surya"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    theme: cosmo
+    fig-width: 12
+    fig-height: 9
+    embed-resources: true
+---
+
+# Overview
+
+To generate a plot of Uniquely differentially expressed in each tissue. Similar to Figure 4F in the manuscript, but for all targets of TFs (not just DAF-16).
+
+```{r setup, include=FALSE}
+
+rm(list = ls())
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  dpi = 300
+)
+
+options(scipen = 10000)
+
+```
+
+# Load Required Packages
+
+```{r}
+#| label: setup-libraries
+#| message: false
+#| warning: false
+
+library(ggplot2)
+library(dplyr)
+library(readxl)
+library(purrr)
+library(tibble)
+
+```
+
+
+# Load Data
+
+```{r load-log2fc-data}
+# Load celest_network for bg
+celest_network <- read.delim("celest/input/orthCelEsT.txt", header = TRUE, stringsAsFactors = FALSE)
+
+# detection matrix to filter bg coz they are tissue_specific
+detection_matrix <- read.delim("output/detection_matrix_tissue.txt", header = TRUE, stringsAsFactors = FALSE)
+
+all_backgrounds  <- readRDS("celest/output/all_backgrounds.rds")
+all_tf_activity  <- readRDS("celest/output/all_tf_activity.rds")
+
+tf_annotation <- read_xlsx("celest/input/Table S1 - TF annotation.xlsx", sheet = "Table S1 - TF annotation")
+
+# top 50
+top_tf_ranked <- read.table("celest/output/tf_rank_top50_score.tsv", header = TRUE)
+
+```
+
+
+```{r enrichment-overall-tf-families, fig.width=10, fig.height=6}
+
+sig_p <- 0.05   # significance threshold
+
+identical(names(all_tf_activity), names(all_backgrounds))
+
+tf_family_lookup <- tf_annotation %>%
+  select(wormbase_gene, wormbase_gseq, Family_for_FigS4) %>%
+  distinct()
+
+# attach family names to all_tf_activity and all_backgrounds
+all_tf_activity_fam <- map(all_tf_activity, function(df) {
+  df %>% left_join(tf_family_lookup, by = c("wb_id" = "wormbase_gene"))
+})
+
+all_backgrounds_fam <- map(all_backgrounds, function(tf_vec) {
+  tibble(wb_id = tf_vec) %>%
+    left_join(tf_family_lookup, by = c("wb_id" = "wormbase_gseq"))
+})
+
+# filter significant TFs
+sig_tf_activity <- map(all_tf_activity_fam, function(df) {
+  df %>% filter(p_value < sig_p)
+})
+
+# Per-tissue enrichment test function 
+enrichment_one_tissue <- function(sig_df, bg_df) {
+  bg_df  <- bg_df  %>% filter(!is.na(Family_for_FigS4))
+  sig_df <- sig_df %>% filter(!is.na(Family_for_FigS4))
+
+  families  <- unique(bg_df$Family_for_FigS4)
+  total_bg  <- nrow(bg_df)
+  total_sig <- nrow(sig_df)
+
+  map_dfr(families, function(fam) {
+    sig_in_fam <- sum(sig_df$Family_for_FigS4 == fam)
+    bg_in_fam  <- sum(bg_df$Family_for_FigS4 == fam)
+
+    mat <- matrix(
+      c(sig_in_fam,               bg_in_fam - sig_in_fam,
+        total_sig - sig_in_fam,   (total_bg - bg_in_fam) - (total_sig - sig_in_fam)),
+      nrow = 2, byrow = TRUE,
+      dimnames = list(c("in_family", "not_family"),
+                       c("significant", "not_significant"))
+    )
+
+    ft <- fisher.test(mat, alternative = "greater")
+
+    tibble(
+      family          = fam,
+      n_sig_in_family = sig_in_fam,
+      n_sig_total     = total_sig,
+      n_bg_in_family  = bg_in_fam,
+      n_bg_total      = total_bg,
+      odds_ratio      = unname(ft$estimate),
+      p_value         = ft$p.value
+    )
+  })
+}
+
+enrichment_results <- map2_dfr(
+  sig_tf_activity, all_backgrounds_fam,
+  enrichment_one_tissue,
+  .id = "tissue"
+) %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
+  arrange(p_adj)
+
+# Now combine results across all tissyes using Fisher's combined probability test
+
+family_enrichment_fcombined <- enrichment_results %>%
+  group_by(family) %>%
+  summarise(
+    n_tissues = n(),
+
+    tissues_OR_gt1 =
+      sum(odds_ratio > 1, na.rm = TRUE),
+
+    tissues_sig =
+      sum(p_value < 0.05 & odds_ratio > 1, na.rm = TRUE),
+
+    median_OR =
+      median(odds_ratio, na.rm = TRUE),
+
+    fisher_stat =
+      -2 * sum(log(p_value)),
+
+    fisher_p =
+      pchisq(
+        fisher_stat,
+        df = 2 * n(),
+        lower.tail = FALSE
+      ),
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    fisher_FDR = p.adjust(fisher_p, method = "BH")
+  ) %>%
+  arrange(fisher_FDR)
+
+```
+
+```{r enrichment-plot}
+
+family_enrichment_fcombined_plot <- ggplot(family_enrichment_fcombined, aes( x = reorder(family, tissues_OR_gt1), y = tissues_OR_gt1, fill = median_OR)) +
+  geom_col(color = "grey30", linewidth = 0.2) +
+  geom_text(
+    aes(label = paste0("FDR=", formatC(fisher_FDR, format = "e", digits = 2),
+                        "  (", tissues_OR_gt1, "/", n_tissues, ")")),
+    hjust = -0.05,
+    size = 3
+  ) +
+  coord_flip(clip = "off") +
+  scale_fill_gradient(
+    low = "grey85", high = "#D62828",
+    name = "Median OR"
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.35))) +
+  labs(
+    x = "TF family",
+    y = "# tissues with OR > 1",
+    title = "TF family enrichment across tissues",
+    caption = "Bar color = median odds ratio across tissues · Labels: Fisher-combined FDR and (# OR>1 / # tissues tested)"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    plot.caption = element_text(size = 8, color = "grey50", hjust = 0)
+  )
+
+ggsave(
+  filename = "celest/plots/tf_family_enrichment_fcombined_plot.pdf", 
+  plot = family_enrichment_fcombined_plot,
+  width = 12, 
+  height = 8, 
+  units = "in",
+  device = cairo_pdf
+)
+```
+
+
+# Match and add TF family names to the top50 TFs
+
+```{r add-tf-families-top50, fig.width=10, fig.height=6}
+
+# Build a name-matching lookup with both locus and sequence names, uppercased
+
+tf_family_lookup_named <- tf_annotation %>%
+  select(wormbase_locus, wormbase_gseq, Family_for_FigS4) %>%
+  mutate(
+    wormbase_locus = toupper(wormbase_locus),
+    wormbase_gseq  = toupper(wormbase_gseq)
+  ) %>%
+  distinct()
+
+top_tf_ranked <- top_tf_ranked %>%
+  left_join(
+    tf_family_lookup_named %>% select(wormbase_locus, Family_for_FigS4),
+    by = c("public_name" = "wormbase_locus")
+  ) %>%
+  dplyr::rename(family_from_locus = Family_for_FigS4) %>%
+  left_join(
+    tf_family_lookup_named %>% select(wormbase_gseq, Family_for_FigS4),
+    by = c("public_name" = "wormbase_gseq")
+  ) %>%
+  dplyr::rename(family_from_gseq = Family_for_FigS4) %>%
+  mutate(
+    Family_for_FigS4 = coalesce(family_from_locus, family_from_gseq)
+  ) %>%
+  select(-family_from_locus, -family_from_gseq)
+
+top50_tfs <- top_tf_ranked
+
+combined_background <- bind_rows(all_backgrounds_fam) %>%
+  distinct(wb_id, .keep_all = TRUE) %>%
+  filter(!is.na(Family_for_FigS4))
+```
+
+# Enrichment test for top50 TFs
+```{r enrichment-overall-tf-families-top50, fig.width=10, fig.height=6}
+enrichment_top50 <- function(top_df, bg_df) {
+  families <- unique(bg_df$Family_for_FigS4)
+  total_bg  <- nrow(bg_df)
+  total_top <- nrow(top_df)
+
+  purrr::map_dfr(families, function(fam) {
+    top_in_fam <- sum(top_df$Family_for_FigS4 == fam)
+    bg_in_fam  <- sum(bg_df$Family_for_FigS4 == fam)
+    mat <- matrix(
+      c(
+        top_in_fam,
+        bg_in_fam - top_in_fam,
+        total_top - top_in_fam,
+        (total_bg - bg_in_fam) - (total_top - top_in_fam)
+      ),
+      nrow = 2,
+      byrow = TRUE,
+      dimnames = list(
+        c("in_family", "not_family"),
+        c("top50", "not_top50")
+      )
+    )
+
+    ft <- fisher.test(mat, alternative = "greater")
+
+    tibble(
+      family = fam,
+      n_top50_in_family = top_in_fam,
+      n_top50_total = total_top,
+      n_bg_in_family = bg_in_fam,
+      n_bg_total = total_bg,
+      odds_ratio = unname(ft$estimate),
+      p_value = ft$p.value
+    )
+  })
+}
+
+top50_family_enrichment <- enrichment_top50(
+  top_df = top50_tfs,
+  bg_df = combined_background
+) %>%
+  mutate(
+    p_adj = p.adjust(p_value, method = "BH")
+  ) %>%
+  arrange(p_adj)
+```
+
+# Export
+
+```{r export}
+
+write.csv(family_enrichment_fcombined, "celest/output/tf_family_enrichment_fcombined.csv", row.names = FALSE)
+write.csv(top50_family_enrichment, "celest/output/top50_tf_family_enrichment.csv", row.names = FALSE)
+
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+

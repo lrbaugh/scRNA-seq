@@ -1,0 +1,691 @@
+---
+title: "Cell Type - Detection and Differential Expression Analysis"
+author: "Sharan Surya"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    theme: cosmo
+    fig-width: 12
+    fig-height: 9
+    embed-resources: true
+---
+
+# Overview
+
+Are cell type-specific DEGs truly cell type-specific in their expression, or are they expressed in other cell types where they're just not differentially expressed?
+
+- **Detection:** Gene detected if normalized counts (starved OR fed) > threshold (threshold = 0.1)
+- **DEGs:** Gene is DE if padj < 0.05 AND |log2FC| > 0
+
+
+
+```{r setup, include=FALSE}
+rm(list = ls())
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  dpi = 300
+)
+
+options(scipen = 10000)
+
+```
+
+# Load Required Packages
+
+```{r}
+#| label: setup-libraries
+#| message: false
+#| warning: false
+
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(ggrepel)
+library(scales) # for comma formatting in axis labels
+library(viridis)
+library(seriation) # for OLO reordering of hclust
+```
+
+# Load Data
+
+
+## Load Log2FC Data
+
+```{r load-log2fc-data}
+# Load the combined log2FC file (cell type resolution)
+log2fc_data <- readRDS("input/all_genes_per_celltype_log2FC_20231116.rds")
+
+celltype_names <- unique(log2fc_data$celltype)
+
+celltype_order <- c(
+  "BAG", "RIH", "AFD", "Germline", "Z1Z4", "ExcretoryDuct", "Seam",
+  "NonSeamHypoderm", "AmPhSheath", "URX", "XXX", "Coelomocyte", "ExcretoryGland",
+  "PharyngealGland", "AntArcade", "PharyngealMuscle", "BWM", "NonStriatedMuscle", "hmc", "CEPsh",
+  "Intestine", "FLP", "AVL", "M4I4", "NSM", "MI", "LUA", "IL2",
+  "URB", "PVR", "I1I2I3", "DVC", "RMG", "RIG", "RIB", "RIM",
+  "AIB", "AIZ", "ADA", "URA", "GLR", "AIM", "AIN", "AIY",
+  "RIA", "AVB", "AVK", "RIC", "RMDSMD", "DADB", "DDVD",
+  "SIASIB", "TouchReceptorNeurons", "PVP", "AVJ", "BDU", "SMB", "RID", "RIV",
+  "RIF", "AIA", "DVA", "PVQ", "OLL", "ALA", "PVT", "RIS",
+  "RIR", "ASI", "ASH", "PHAPHB", "ASK", "AUA", "ADF", "ASJ",
+  "AWA", "ASG", "ASE", "ADL"
+)
+
+# Check cell types match
+celltype_names %in% celltype_order
+
+# Filter to protein-coding genes only
+log2fc_data <- log2fc_data[log2fc_data$gene_biotype == "protein_coding", ]
+```
+
+# Data Processing
+
+## Create Detection Matrix
+
+```{r create-detection-matrix}
+# Detection threshold
+detection_threshold <- 0.1  # 10% of cells expressing a gene
+
+# Get unique gene IDs across all cell types
+all_protein_coding_gene_ids <- unique(log2fc_data$gene_id)
+
+# Initialize detection matrix: rows = genes, cols = cell types, values = 0/1
+detection_matrix <- matrix(0,
+                           nrow = length(all_protein_coding_gene_ids),
+                           ncol = length(celltype_names),
+                           dimnames = list(all_protein_coding_gene_ids, celltype_names))
+
+# Fill detection matrix. If detected, 1, else 0
+for (i in 1:nrow(log2fc_data)) {
+  gene    <- log2fc_data$gene_id[i]
+  ct      <- log2fc_data$celltype[i]
+
+  pct_starved       <- log2fc_data$pct.starv[i]
+  pct_fed           <- log2fc_data$pct.fed[i]
+  max_pct_expressed <- max(pct_starved, pct_fed, na.rm = TRUE)
+
+  if (!is.na(max_pct_expressed) && max_pct_expressed >= detection_threshold) {
+    detection_matrix[gene, ct] <- 1
+  }
+}
+
+genes_detected_per_celltype <- colSums(detection_matrix)
+```
+
+
+## Create DEG Matrix
+
+```{r create-deg-matrix}
+# Significance thresholds
+padj_threshold   <- 0.05
+log2fc_threshold <- 0
+
+# Filter to rows above detection threshold
+log2fc_data <- log2fc_data %>%
+  filter(pct.starv >= detection_threshold | pct.fed >= detection_threshold)
+
+# Initialize DEG matrix: rows = genes, cols = cell types, values = 0/1
+deg_matrix <- matrix(0,
+                     nrow = length(all_protein_coding_gene_ids),
+                     ncol = length(celltype_names),
+                     dimnames = list(all_protein_coding_gene_ids, celltype_names))
+
+# Fill DEG matrix
+for (i in 1:nrow(log2fc_data)) {
+  gene   <- log2fc_data$gene_id[i]
+  ct     <- log2fc_data$celltype[i]
+  padj   <- log2fc_data$padj[i]
+  log2fc <- log2fc_data$log2FoldChange[i]
+
+  if (!is.na(padj) && !is.na(log2fc)) {
+    if (padj < padj_threshold && abs(log2fc) > log2fc_threshold) {
+      deg_matrix[gene, ct] <- 1
+    }
+  }
+}
+
+sum(rowSums(deg_matrix) > 0) # Should be 8573 according to Jinxian!
+
+degs_detected_per_celltype <- colSums(deg_matrix)
+```
+
+# Jaccard Similarity Analysis
+
+Calculate Jaccard statistic for each gene:
+
+**Jaccard = (# cell types where gene is DE) / (# cell types where gene is detected)**
+
+This answers: "Of all cell types where a gene is expressed, in what proportion is it differentially expressed?"
+
+- Jaccard = 1.0: Gene is DE in every cell type where it's expressed
+- Jaccard = 0.0: Gene is never DE despite being expressed
+- Jaccard = 0.5: Gene is DE in half the cell types where it's expressed
+
+```{r jaccard-calculation}
+# Calculate Jaccard for each gene
+# Jaccard = n_deg_celltypes / n_detected_celltypes (per gene)
+calculate_jaccard <- function(detection_vector, deg_vector) {
+  n_detected_celltypes <- sum(detection_vector == 1)
+  n_deg_celltypes      <- sum(deg_vector == 1)
+
+  if (n_detected_celltypes == 0) return(NA)
+
+  return(n_deg_celltypes / n_detected_celltypes)
+}
+
+gene_jaccard_scores <- sapply(all_protein_coding_gene_ids, function(gene) {
+  calculate_jaccard(detection_matrix[gene, ], deg_matrix[gene, ])
+})
+
+gene_jaccard_df <- data.frame(
+  gene_id              = all_protein_coding_gene_ids,
+  jaccard              = gene_jaccard_scores,
+  n_detected_celltypes = rowSums(detection_matrix),
+  n_deg_celltypes      = rowSums(deg_matrix),
+  stringsAsFactors     = FALSE
+)
+
+# Add gene names
+gene_jaccard_df$gene_name <- log2fc_data$gene_name[match(gene_jaccard_df$gene_id,
+                                                          log2fc_data$gene_id)]
+
+# Filter out genes not detected in any cell type
+gene_jaccard_detected <- gene_jaccard_df[!is.na(gene_jaccard_df$jaccard), ]
+```
+
+# Plot 1: Detection vs DEG Scatter
+
+```{r scatter-plot, fig.width=10, fig.height=8}
+celltype_detection_deg_counts <- data.frame(
+  celltype = celltype_names,
+  n_detected_genes = genes_detected_per_celltype,
+  n_degs   = degs_detected_per_celltype
+)
+
+detection_deg_cor <- cor.test(celltype_detection_deg_counts$n_detected_genes, 
+                               celltype_detection_deg_counts$n_degs)
+
+scatter_plot <- ggplot(celltype_detection_deg_counts, aes(x = n_detected_genes, y = n_degs)) +
+  geom_point(size = 2.5, alpha = 0.75, color = "#4E6D8C") +
+  geom_text_repel(
+    aes(label = celltype),
+    size = 1.5,
+    box.padding = 0.5,
+    max.overlaps = 50,
+    segment.size = 0.25
+  ) +
+  geom_abline(slope = 1, intercept = 0, color = "#C0392B", linetype = "dashed", linewidth = 0.3) +
+  labs(
+    x = "Number of Detected Genes",
+    y = "Number of DEGs"
+  ) +
+  scale_x_continuous(labels = comma, limits = c(0, 5000)) +
+  scale_y_continuous(labels = comma, limits = c(0, 5000)) +
+  theme_classic(base_size = 8) +
+  theme(
+    text = element_text(family = "Arial"),
+    axis.title = element_text(size = 8, face = "bold"),
+    panel.grid = element_blank(),
+    axis.title.x = element_text(margin = margin(t = 5)),
+    axis.title.y = element_text(margin = margin(r = 5))
+
+  )
+
+ggsave(
+  filename = "plots/scatter_detected_vs_deg_celltype.pdf", 
+  plot = scatter_plot,
+  width = 5, 
+  height = 2.5, 
+  units = "in",
+  device = cairo_pdf 
+)
+```
+
+
+# Plot 2: Jaccard Distribution
+```{r jaccard-dist, fig.width=12, fig.height=8}
+jaccard_median <- median(gene_jaccard_detected$jaccard)
+jaccard_mean   <- mean(gene_jaccard_detected$jaccard)
+
+jaccard_hist_plot <- ggplot(gene_jaccard_detected, aes(x = jaccard)) +
+  geom_histogram(binwidth = 0.02, boundary = 0, fill = "#4E6D8C", color = "white", alpha = 0.8) +
+  geom_vline(xintercept = jaccard_median, linetype = "dashed", 
+             color = "#2C3E50", linewidth = 1) +
+  geom_vline(xintercept = jaccard_mean, linetype = "dotted",
+             color = "#16A085", linewidth = 1) +
+  annotate("text", x = jaccard_median, y = Inf,
+           label = paste("Median =", round(jaccard_median, 3)),
+           vjust = 1.5, hjust = -0.1, size = 4, fontface = "bold",
+           color = "#2C3E50") +
+  annotate("text", x = jaccard_mean, y = Inf,
+           label = paste("Mean =", round(jaccard_mean, 3)),
+           vjust = 3, hjust = -0.1, size = 4, fontface = "bold",
+           color = "#16A085") +
+  scale_x_continuous(breaks = seq(0, 1, 0.1), limits = c(0, 1)) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    x = "Jaccard Index (# cell types DE / # cell types detected)",
+    y = "Number of Genes",
+    title = "Proportion of Detected Tissues Where Genes are Differentially Expressed",
+    subtitle = "Jaccard = 1: DE in all cell types where expressed | Jaccard = 0: Never DE despite expression"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title    = element_text(size = 14, face = "bold", hjust = 0.5, margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey40", margin = margin(b = 15)),
+    axis.title    = element_text(size = 11, face = "bold"),
+    panel.grid = element_blank()
+  )
+
+
+ggsave(
+  filename = "plots/jaccard_distribution_celltype.pdf", 
+  plot = jaccard_hist_plot,
+  width = 12, 
+  height = 4, 
+  units = "in",
+  device = cairo_pdf
+)
+```
+
+# Plot 3: Detection vs DEG Breadth (No of cell types in both x and y)
+
+```{r expression-vs-de-circles}
+detection_vs_deg_breadth_plot <- ggplot(gene_jaccard_detected, aes(x = n_detected_celltypes, y = n_deg_celltypes)) +
+  geom_count(color = "#4E6D8C", alpha = 0.65) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", 
+              color = "#C0392B", linewidth = 0.5) +
+  scale_size_continuous(
+    name = "Number\nof Genes",
+    range = c(1, 5),
+    labels = comma
+  ) +
+  labs(
+    x = "Number of Cell Types Gene is Detected",
+    y = "Number of Cell Types Gene is DE"
+  ) +
+  scale_x_continuous(
+  breaks = seq(0, 80, 5),        # labels every 5
+  )+
+  scale_y_continuous(
+  breaks = seq(0, 80, 5),        # labels every 5
+  )+
+  theme_classic(base_size = 8) +
+  theme(
+    text = element_text(family = "Arial"),
+    axis.title    = element_text(size = 8, face = "bold"),
+    legend.position  = "NA",
+    axis.title.x = element_text(size = 7),
+    axis.title.y = element_text(size = 7)
+  )
+
+ggsave(
+  filename = "plots/expression_breadth_vs_de_breadth_celltype.pdf", 
+  plot = detection_vs_deg_breadth_plot,
+  width = 5, 
+  height = 5, 
+  units = "in",
+  device = cairo_pdf
+)
+```
+
+
+
+
+# Cell Type Specificity
+
+Number of gene (y) vs Number of Cell Types Gene is DE (x) - this shows how many genes are DE in only 1 cell type, 2 cell types, etc.
+
+```{r celltype-deg-specificity, fig.width=12, fig.height=8}
+deg_celltype_breadth <- data.frame(
+  gene_id      = rownames(deg_matrix),
+  n_celltypes_de = rowSums(deg_matrix)
+) %>% filter(n_celltypes_de > 0)
+
+deg_breadth_barplot <- ggplot(deg_celltype_breadth, aes(x = n_celltypes_de)) +
+  geom_bar(fill = "#4E6D8C", color = "white", alpha = 0.8, width = 0.9) +
+  #geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5, size = 3.5) +
+  scale_x_reverse(
+    breaks = seq(0, 80, 5)
+  ) +
+  scale_y_continuous(
+    trans = scales::log_trans(base = 10),
+    labels = comma,
+    limits = c(1, NA)
+  ) +
+  labs(
+    x = "Number of Cell Types Gene is DE",
+    y = "Number of Genes",
+  ) +
+  theme_classic(base_size = 8) +
+  theme(
+    text = element_text(family = "Arial"),
+    axis.title = element_text(size = 8, face = "bold"),
+    axis.text.y = element_text(angle = 90, vjust = 0.5,hjust = 0.5),
+    panel.grid = element_blank(),
+    axis.title.x = element_text(size = 7),
+    axis.title.y = element_text(size = 7)
+  )
+
+
+ggsave(
+  filename = "plots/deg_specificity_celltype.pdf", 
+  plot = deg_breadth_barplot,
+  width = 5, 
+  height = 1.2, 
+  units = "in",
+  device = cairo_pdf
+)
+```
+
+
+# Cell Type Detection Specificity
+
+Number of gene (y) vs Number of Cell Types Gene is detected in (x) - this shows how many genes are detected in only 1 cell type, 2 cell types, etc.
+
+```{r celltype-detection-specificity, fig.width=12, fig.height=8}
+detection_celltype_breadth <- data.frame(
+  gene_id      = rownames(detection_matrix),
+  n_celltypes_detected = rowSums(detection_matrix)
+) %>% filter(n_celltypes_detected > 0)
+
+n_distinct(detection_celltype_breadth$gene_id)
+
+detection_breadth_barplot <- ggplot(detection_celltype_breadth, aes(x = n_celltypes_detected)) +
+  geom_bar(fill = "#4E6D8C", color = "white", alpha = 0.8, width = 0.9) +
+  #geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5, size = 3.5) +
+  scale_x_continuous(
+    breaks = seq(0, 80, 5)
+  ) +
+  scale_y_continuous(
+    trans = scales::log_trans(base = 10),
+    labels = comma,
+    limits = c(1, NA)
+  ) +
+  labs(
+    x = "Number of Cell Types Gene is Detected",
+    y = "Number of Genes"
+  ) +
+  
+  theme_classic(base_size = 8) +
+  theme(
+    text = element_text(family = "Arial"),
+    axis.title = element_text(size = 8, face = "bold"),
+    panel.grid = element_blank(),
+    axis.title.x = element_text(size = 7),
+    axis.title.y = element_text(size = 7)
+  )
+
+
+ggsave(
+  filename = "plots/detection_specificity_celltype.pdf", 
+  plot = detection_breadth_barplot,
+  width = 5, 
+  height = 1.2, 
+  units = "in",
+  device = cairo_pdf
+)
+```
+
+
+# Total DEGs per Cell Type
+
+Number of DEGs per cell type (y) vs Cell Type (x) — shows how many DEGs are in each cell type, regardless of whether they are unique or shared with other cell types.
+
+```{r total-degs}
+degs_per_celltype_vec <- colSums(deg_matrix)
+
+total_deg_per_celltype <- data.frame(
+  celltype = names(degs_per_celltype_vec),
+  n_degs = degs_per_celltype_vec
+)
+
+total_deg_barplot <- ggplot(total_deg_per_celltype, aes(x = reorder(celltype, n_degs), y = n_degs)) +
+  geom_bar(stat = "identity", fill = "#4E6D8C", alpha = 0.8) +
+  #geom_text(aes(label = n_degs), vjust = -0.5, size = 3.5) +
+  labs(
+    title = "Differentially Expressed Genes per Cell Type",
+    x = "Cell Type",
+    y = "Number of DEGs"
+  ) +
+  scale_x_discrete(labels = c(
+    "TouchReceptorNeurons" = "TRNs",
+    "ExcretoryGland" = "ExcGland", 
+    "PharyngealGland" = "PhaGland",
+    "Coelomocyte" = "Coel",
+    "PharyngealMuscle" = "PhaMuscle",
+    "NonStriatedMuscle" = "NonStriMus",
+    "AmPhSheath" = "AmPhSh",
+    "AntArcade" = "AntArc",
+    "ExcretoryDuct" = "ExcDuct",
+    "NonSeamHypoderm" = "Hypoderm"
+  )) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  theme_bw(base_size = 12) +
+  theme(
+    aspect.ratio = 0.3,
+    plot.title  = element_text(size = 14, face = "bold", hjust = 0.5),
+    axis.title  = element_text(size = 12, face = "bold"),
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+ggsave(
+  filename = "plots/degs_per_celltype.pdf", 
+  plot = total_deg_barplot,
+  width = 12, 
+  height = 8, 
+  units = "in",
+  device = cairo_pdf
+)
+
+cat("\nTotal DEGs across all cell types:", sum(total_deg_per_celltype$n_degs), "\n")
+```
+
+
+# Unique DEGs per Cell Type
+
+Number of DEGs that are unique to each cell type (y) vs Cell Type (x) — shows how many DEGs are found in only one cell type, which is a stronger indication of cell type-specificity.
+
+```{r unique-degs}
+# Genes DE in exactly one cell type
+single_celltype_deg_matrix <- deg_matrix[rowSums(deg_matrix) == 1, ]
+single_celltype_deg_counts_per_celltype <- colSums(single_celltype_deg_matrix)
+
+# Convert to data frame for plotting
+unique_deg_per_celltype <- data.frame(
+  celltype       = names(single_celltype_deg_counts_per_celltype),
+  n_unique_degs  = single_celltype_deg_counts_per_celltype
+)
+```
+
+```{r unique-degs-barplot, fig.width=12, fig.height=8}
+unique_deg_barplot <- ggplot(unique_deg_per_celltype, aes(x = reorder(celltype, n_unique_degs), y = n_unique_degs)) +
+  geom_bar(stat = "identity", fill = "#4E6D8C", alpha = 0.8) +
+  #geom_text(aes(label = n_unique_degs), vjust = -0.5, size = 3.5) +
+  labs(
+    title    = "Uniquely Differentially Expressed Genes per Cell Type",
+    subtitle = "DEGs found in only one cell type",
+    x = "Cell Type",
+    y = "Number of Unique DEGs"
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  scale_x_discrete(labels = c(
+    "TouchReceptorNeurons" = "TRNs",
+    "ExcretoryGland" = "ExcGland", 
+    "PharyngealGland" = "PhaGland",
+    "Coelomocyte" = "Coel",
+    "PharyngealMuscle" = "PhaMuscle",
+    "NonStriatedMuscle" = "NonStriMus",
+    "AmPhSheath" = "AmPhSh",
+    "AntArcade" = "AntArc",
+    "ExcretoryDuct" = "ExcDuct",
+    "NonSeamHypoderm" = "Hypoderm"
+  )) +
+  theme_bw(base_size = 12) +
+  theme(
+    aspect.ratio = 0.3,
+    plot.title    = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5, color = "grey40"),
+    axis.title    = element_text(size = 12, face = "bold"),
+    axis.text.x   = element_text(angle = 90, hjust = 1),
+    legend.position = "none",
+    panel.grid = element_blank()
+  )
+
+ggsave(
+  filename = "plots/unique_degs_per_celltype.pdf", 
+  plot = unique_deg_barplot,
+  width = 12, 
+  height = 8, 
+  units = "in",
+  device = cairo_pdf
+)
+
+
+cat("\nTotal unique DEGs across all cell types:", sum(unique_deg_per_celltype$n_unique_degs), "\n")
+```
+
+# Heatmaps of Log2FC per Cell Type
+
+```{r lfc-heatmap-prep}
+
+# Up/down regulation colors
+col_upregulated   <- "#7B2D8B"   # purple
+col_downregulated <- "#A8C500"   # yellow-green
+
+lfc_long <- log2fc_data %>%
+  select(gene_id, gene_name, log2FoldChange, padj, celltype) %>%
+  group_by(gene_name) %>%
+  filter(any(padj < 0.05, na.rm = TRUE)) %>%
+  ungroup()
+
+n_distinct(lfc_long$gene_id)
+
+# Build gene x celltype matrix of log2FC values
+lfc_matrix <- lfc_long %>%
+  select(gene_name, celltype, log2FoldChange) %>%
+  pivot_wider(names_from = celltype, values_from = log2FoldChange) %>%
+  column_to_rownames("gene_name") %>%
+  as.matrix()
+
+lfc_matrix <- lfc_matrix[rowSums(!is.na(lfc_matrix)) > 0, ]
+lfc_matrix[is.na(lfc_matrix)] <- 0
+
+# Pearson distance + complete linkage hclust
+pearson_dist_genes <- as.dist(1 - cor(t(lfc_matrix), method = "pearson"))
+hclust_genes       <- hclust(pearson_dist_genes, method = "complete")
+
+# Apply OLO reordering - takes a long time!
+hclust_genes_olo <- reorder(hclust_genes, pearson_dist_genes, method = "OLO")
+
+# Extract new gene order
+gene_order_levels <- hclust_genes_olo$labels[hclust_genes_olo$order]
+
+all_celltypes <- unique(lfc_long$celltype)
+
+lfc_long_ordered <- lfc_long %>%
+  select(gene_name, celltype, log2FoldChange, padj) %>%
+  complete(gene_name, celltype = all_celltypes) %>%
+  mutate(
+    direction = case_when(
+      log2FoldChange > 0 & padj < 0.05 ~ "Upregulated",
+      log2FoldChange < 0 & padj < 0.05 ~ "Downregulated",
+      TRUE                              ~ NA_character_
+    ),
+    gene_name = factor(gene_name, levels = gene_order_levels),
+    celltype  = factor(celltype, levels = celltype_order)
+  )
+
+deg_heatmap_celltype <- ggplot(lfc_long_ordered, aes(x = celltype, y = gene_name, fill = direction)) +
+  geom_tile(color = NA, alpha = 0.85) +
+  scale_fill_manual(
+    values       = c("Upregulated" = col_upregulated, "Downregulated" = col_downregulated),
+    na.value     = "black",
+    na.translate = FALSE,
+    name         = "Direction (starved/fed)"
+  ) +
+  labs(
+    title    = "Log2FC Across Cell Types",
+    subtitle = paste0(n_distinct(lfc_long$gene_id), " significant genes"),
+    x        = "Cell Type",
+    y        = NULL
+  ) +
+  scale_x_discrete(labels = c(
+    "TouchReceptorNeurons" = "TRNs",
+    "ExcretoryGland"       = "ExcGland",
+    "PharyngealGland"      = "PhaGland",
+    "Coelomocyte"          = "Coel",
+    "PharyngealMuscle"     = "PhaMuscle",
+    "NonStriatedMuscle"    = "NonStriMus",
+    "AmPhSheath"           = "AmPhSh",
+    "AntArcade"            = "AntArc",
+    "ExcretoryDuct"        = "ExcDuct",
+    "NonSeamHypoderm"      = "Hypoderm"
+  )) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title       = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle    = element_text(size = 11, hjust = 0.5, color = "grey40"),
+    axis.title       = element_text(size = 12, face = "bold"),
+    axis.text.x      = element_text(angle = 90, hjust = 1, size = 12),
+    axis.text.y      = element_blank(),
+    axis.ticks.y     = element_blank(),
+    legend.position  = "top",
+    legend.title     = element_text(size = 12, face = "bold"),
+    legend.key.width = unit(2, "cm"),
+    panel.grid       = element_blank(),
+    panel.background = element_rect(fill = "black")
+  )
+
+
+ggsave(
+  filename = "plots/deg_heatmap_celltype.pdf", 
+  plot = deg_heatmap_celltype,
+  width = 12, 
+  height = 12, 
+  units = "in",
+  device = cairo_pdf
+)
+```
+
+
+# Export Results
+
+```{r export}
+write.table(gene_jaccard_df, "output/gene_jaccard_results_celltype.txt",
+            sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(detection_matrix, "output/detection_matrix_celltype.txt",
+            sep = "\t", quote = FALSE, col.names = NA)
+write.table(deg_matrix, "output/deg_matrix_celltype.txt",
+            sep = "\t", quote = FALSE, col.names = NA)
+
+celltype_summary_stats <- data.frame(
+  celltype           = celltype_names,
+  n_detected_genes   = genes_detected_per_celltype,
+  n_degs             = degs_detected_per_celltype,
+  pct_deg            = round(100 * degs_detected_per_celltype / genes_detected_per_celltype, 2)
+)
+
+write.table(celltype_summary_stats, "output/summary_celltype.txt",
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+cat("Results exported\n")
+```
+
+
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+
